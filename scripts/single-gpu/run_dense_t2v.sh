@@ -9,6 +9,9 @@ if [[ -d /usr/local/cuda/compat ]]; then
 fi
 export PYTHONPATH="$ROOT_DIR:$ROOT_DIR/rewriter:${PYTHONPATH:-}"
 export DIFFUSERS_ATTN_BACKEND="${DIFFUSERS_ATTN_BACKEND:-_native_flash}"
+# FlashAttention 3 is not available in the glibc 2.17 / cu118 compatibility
+# environment.  Qwen3-VL can use PyTorch SDPA for the text condition instead.
+export LINGBOT_QWEN_ATTN_IMPLEMENTATION="${LINGBOT_QWEN_ATTN_IMPLEMENTATION:-sdpa}"
 
 PYTHON_BIN="${PYTHON_BIN:-python}"
 MODEL_DIR="${MODEL_DIR:-}"
@@ -51,7 +54,6 @@ mkdir -p "$OUT_DIR"
   --fps "$FPS" \
   --transformer_dtype bf16 \
   --text_encoder_dtype bf16 \
-  --vae_dtype fp32 \
-  --batch_cfg
+  --vae_dtype fp32
 
 echo "Saved: $OUT_DIR/t2v.mp4"

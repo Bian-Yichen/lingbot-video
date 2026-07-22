@@ -1,0 +1,15 @@
+# Compatibility dependencies for CentOS 7 / glibc 2.17 environments.
+# Install torch and torchvision first with scripts/setup_glibc217_cu118.sh.
+accelerate>=1.8.0
+decord>=0.6.0
+diffusers==0.39.0
+imageio>=2.35.0
+imageio-ffmpeg>=0.5.1
+json_repair>=0.30
+numpy>=1.26
+peft==0.19.1
+pillow>=10.4.0
+requests>=2.31
+safetensors>=0.4.5
+scipy>=1.11
+transformers==5.8.1
