@@ -2,12 +2,12 @@ from __future__ import annotations
 
 """Compatibility helpers for older PyTorch runtimes.
 
-LingBot-Video's reference environment uses a recent PyTorch nightly.  PyTorch
-2.6's custom-op schema inference does not resolve postponed/string type
-annotations before validating a function signature.  Recent Diffusers and
-Transformers define several custom ops in modules that use
-``from __future__ import annotations``; importing those modules therefore fails
-with an ``unsupported type torch.Tensor`` error on PyTorch 2.6.
+LingBot-Video's reference environment uses a recent PyTorch nightly.  Older
+PyTorch custom-op schema inference does not consistently resolve postponed or
+string type annotations before validating a function signature.  Recent
+Diffusers and Transformers define several custom ops in modules that use
+``from __future__ import annotations``; importing those modules can therefore
+fail with an ``unsupported type torch.Tensor`` error on PyTorch 2.6.
 
 The patch below is intentionally narrow: it only resolves a decorated
 function's annotations immediately before PyTorch infers its custom-op schema.
@@ -47,20 +47,20 @@ def _resolve_annotations(fn: Callable[..., Any]) -> dict[str, Any] | None:
         return None
 
 
-def _patch_infer_schema(module: ModuleType) -> bool:
-    original = getattr(module, "infer_schema", None)
+def _patch_infer_schema(owner: Any) -> bool:
+    original = getattr(owner, "infer_schema", None)
     if original is None or getattr(original, "_lingbot_string_annotation_compat", False):
         return False
 
-    def infer_schema_compat(fn: Callable[..., Any], mutates_args: Any):
+    def infer_schema_compat(fn: Callable[..., Any], *args: Any, **kwargs: Any):
         original_annotations = getattr(fn, "__annotations__", None)
         resolved = _resolve_annotations(fn)
         if resolved is None:
-            return original(fn, mutates_args)
+            return original(fn, *args, **kwargs)
 
         fn.__annotations__ = resolved
         try:
-            return original(fn, mutates_args)
+            return original(fn, *args, **kwargs)
         finally:
             if original_annotations is None:
                 try:
@@ -72,15 +72,16 @@ def _patch_infer_schema(module: ModuleType) -> bool:
 
     infer_schema_compat._lingbot_string_annotation_compat = True  # type: ignore[attr-defined]
     infer_schema_compat.__wrapped__ = original  # type: ignore[attr-defined]
-    module.infer_schema = infer_schema_compat
+    owner.infer_schema = infer_schema_compat
     return True
 
 
 def install_torch26_custom_op_compat() -> bool:
     """Install the postponed-annotation schema patch on PyTorch <= 2.6.
 
-    Returns ``True`` when at least one internal schema-inference entry point was
-    patched.  On newer PyTorch versions this function is a no-op.
+    PyTorch releases expose schema inference through different aliases.  Patch
+    all known entry points so both the old ``torch._custom_op`` implementation
+    and the newer ``torch.library.custom_op`` path are covered.
     """
 
     try:
@@ -91,7 +92,7 @@ def install_torch26_custom_op_compat() -> bool:
     if _torch_version_tuple(torch) > (2, 6):
         return False
 
-    patched = False
+    patched = _patch_infer_schema(torch.library)
     for module_name in ("torch._custom_op.impl", "torch._library.infer_schema"):
         try:
             module = importlib.import_module(module_name)
