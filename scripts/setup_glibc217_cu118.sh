@@ -34,9 +34,12 @@ fi
 "$PYTHON_BIN" - <<'PY'
 import torch
 import torchvision
+
+# Import the package first so its PyTorch <=2.6 custom-op compatibility patch
+# is installed before Diffusers or Transformers define their custom ops.
+import lingbot_video
 import diffusers
 import transformers
-import lingbot_video
 from lingbot_video.pipeline_lingbot_video import LingBotVideoPipeline
 
 print("torch:", torch.__version__)
