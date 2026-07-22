@@ -3,6 +3,14 @@ from __future__ import annotations
 import importlib
 from typing import Any
 
+from .compat import install_torch26_custom_op_compat
+
+
+# This runs before any lazy import of Diffusers/Transformers-backed modules.  It
+# is a no-op on newer PyTorch versions and fixes postponed type annotations in
+# torch.library custom-op schemas on PyTorch 2.6 and older.
+install_torch26_custom_op_compat()
+
 
 _EXPORTS = {
     "FlowUniPCMultistepScheduler": (
