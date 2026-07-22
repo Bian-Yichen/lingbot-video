@@ -42,9 +42,12 @@ peft==0.19.1
 
 ## 3. 检查导入
 
+兼容补丁由 `lingbot_video` 包初始化，因此手工测试时也要先导入它：
+
 ```bash
 python - <<'PY'
 import torch
+import lingbot_video
 import diffusers
 import transformers
 from lingbot_video.pipeline_lingbot_video import LingBotVideoPipeline
@@ -56,6 +59,8 @@ print("transformers:", transformers.__version__)
 print("LingBot import: OK")
 PY
 ```
+
+正常运行 `scripts/inference.py` 时会自动先加载 `lingbot_video`，无需额外处理导入顺序。
 
 ## 4. 运行官方 T2V 示例
 
@@ -82,9 +87,9 @@ outputs/dense_t2v_glibc217/t2v.mp4
 
 ## 兼容改动说明
 
-PyTorch 2.6 的 custom-op schema 推断不会先解析由
+较旧 PyTorch 的 custom-op schema 推断不会稳定地解析由
 `from __future__ import annotations` 产生的字符串类型注解。Diffusers 0.39
-和 Transformers 5.8 中的部分 custom op 因此会在导入阶段报：
+和 Transformers 5.8 中的部分 custom op 因此可能在导入阶段报：
 
 ```text
 infer_schema(func): Parameter q has unsupported type torch.Tensor
