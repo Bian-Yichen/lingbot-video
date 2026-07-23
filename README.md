@@ -5,6 +5,10 @@
 **📘 English Usage**: [English Documentation](docs/en/index.md) \
 **📕 中文使用文档**: [中文文档](docs/zh/index.md)
 
+**🧭 长场景新轨迹训练（实验分支）**:
+[Dynamic Recurrent Scene Memory](docs/zh/long_scene_training.md) ·
+[研究判断与方案取舍](docs/zh/long_scene_research.md)
+
 We are excited to introduce **LingBot-Video**, the first open-source large-scale MoE (Mixture-of-Experts) video generation model dedicated to embodied intelligence. As a top-tier video model, LingBot-Video is designed to bridge the gap between video synthesis and physical world understanding.
 
 ## 🔥 Key Highlights

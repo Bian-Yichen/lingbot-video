@@ -966,7 +966,7 @@ class LingBotVideoBlock(nn.Module):
 
 
 class LingBotVideoTransformer3DModel(ModelMixin, ConfigMixin):
-    _supports_gradient_checkpointing = False
+    _supports_gradient_checkpointing = True
     _no_split_modules = ["LingBotVideoBlock"]
     _keep_in_fp32_modules = list(LINGBOT_VIDEO_FP32_MODULES)
 
@@ -1078,6 +1078,7 @@ class LingBotVideoTransformer3DModel(ModelMixin, ConfigMixin):
         self.cp_temb_input = nn.Identity()
         self.cp_temb6 = nn.Identity()
         self.cp_out = nn.Identity()
+        self.gradient_checkpointing = False
         self._cp_plan = {
             "cp_joint": {
                 "input": ContextParallelInput(split_dim=1, expected_dims=3),
@@ -1100,19 +1101,53 @@ class LingBotVideoTransformer3DModel(ModelMixin, ConfigMixin):
         timestep: torch.Tensor,                  # (B,) ∈ [0, 1000](= sigma*1000)
         encoder_hidden_states: torch.Tensor,     # (B, L, text_dim)
         encoder_attention_mask: Optional[torch.Tensor] = None,  # (B, L) 1=valid
+        video_token_bias: Optional[torch.Tensor] = None,  # (B, T' * H' * W', hidden_size)
+        additional_condition_tokens: Optional[torch.Tensor] = None,  # (B, M, hidden_size)
         return_dict: bool = True,
     ):
         B, C, T, H, W = hidden_states.shape
         pF, pH, pW = self.config.patch_size
         gt, gh, gw = T // pF, H // pH, W // pW
         n_video = gt * gh * gw
-        L = encoder_hidden_states.shape[1]
+        prompt_length = encoder_hidden_states.shape[1]
+        additional_length = (
+            0
+            if additional_condition_tokens is None
+            else additional_condition_tokens.shape[1]
+        )
+        L = prompt_length + additional_length
         device = hidden_states.device
+        if encoder_hidden_states.shape[0] != B:
+            raise ValueError("Video and condition batch sizes must match")
+        if (
+            encoder_attention_mask is not None
+            and tuple(encoder_attention_mask.shape) != (B, prompt_length)
+        ):
+            raise ValueError(
+                "`encoder_attention_mask` must match the unembedded prompt "
+                f"shape {(B, prompt_length)}"
+            )
+        if additional_condition_tokens is not None:
+            expected_additional_shape = (
+                B,
+                additional_length,
+                self.config.hidden_size,
+            )
+            if tuple(additional_condition_tokens.shape) != expected_additional_shape:
+                raise ValueError(
+                    "`additional_condition_tokens` must have shape "
+                    f"{expected_additional_shape}, got "
+                    f"{tuple(additional_condition_tokens.shape)}."
+                )
         if encoder_attention_mask is not None:
-            text_lens = encoder_attention_mask.sum(dim=-1).long()
+            prompt_lens = encoder_attention_mask.sum(dim=-1).long()
         else:
-            text_lens = torch.full((B,), L, dtype=torch.long, device=device)
+            prompt_lens = torch.full(
+                (B,), prompt_length, dtype=torch.long, device=device
+            )
+        text_lens = prompt_lens + additional_length
         text_lens_list = [int(v) for v in text_lens.detach().cpu().tolist()]
+        prompt_lens_list = [int(v) for v in prompt_lens.detach().cpu().tolist()]
         packed_batch = B > 1
 
         # patchify: token order (f h w), feature order (pf ph pw c) -- matches patchify_and_embed
@@ -1123,7 +1158,6 @@ class LingBotVideoTransformer3DModel(ModelMixin, ConfigMixin):
             pF * pH * pW * C,
         )
         if packed_batch:
-            packed_patch_tokens = patch_tokens.reshape(1, B * n_video, -1)
             x = torch.cat(
                 [self.patch_embedder(patch_tokens[i : i + 1]) for i in range(B)],
                 dim=1,
@@ -1131,11 +1165,35 @@ class LingBotVideoTransformer3DModel(ModelMixin, ConfigMixin):
         else:
             x = self.patch_embedder(patch_tokens)
 
+        if video_token_bias is not None:
+            expected_shape = (B, n_video, self.config.hidden_size)
+            if tuple(video_token_bias.shape) != expected_shape:
+                raise ValueError(
+                    "`video_token_bias` must match the patchified video token grid; "
+                    f"expected {expected_shape}, got {tuple(video_token_bias.shape)}."
+                )
+            if packed_batch:
+                x = x + video_token_bias.reshape(1, B * n_video, -1).to(x.dtype)
+            else:
+                x = x + video_token_bias.to(x.dtype)
+
         if packed_batch:
-            text_parts = [
-                self.text_embedder(encoder_hidden_states[i : i + 1, : text_lens_list[i], :])
-                for i in range(B)
-            ]
+            text_parts = []
+            for i in range(B):
+                prompt_part = self.text_embedder(
+                    encoder_hidden_states[i : i + 1, : prompt_lens_list[i], :]
+                )
+                if additional_condition_tokens is not None:
+                    prompt_part = torch.cat(
+                        (
+                            additional_condition_tokens[i : i + 1].to(
+                                prompt_part.dtype
+                            ),
+                            prompt_part,
+                        ),
+                        dim=1,
+                    )
+                text_parts.append(prompt_part)
             text = torch.cat(text_parts, dim=1)
             joint = _cat_interleave(
                 x,
@@ -1145,12 +1203,25 @@ class LingBotVideoTransformer3DModel(ModelMixin, ConfigMixin):
             )
         else:
             text = self.text_embedder(encoder_hidden_states)
+            if additional_condition_tokens is not None:
+                text = torch.cat(
+                    (additional_condition_tokens.to(text.dtype), text),
+                    dim=1,
+                )
             joint = torch.cat([x, text], dim=1)  # [video; text]
         joint_seq_len = joint.shape[1]
 
-        # Per-sample RoPE: video t-axis start = real text length of this sample + 1
+        # Packed samples use real condition length; padded B=1 keeps full tensor length.
         rotary_parts = [
-            self.rope(make_joint_position_ids(text_lens_list[i], gt, gh, gw, device))
+            self.rope(
+                make_joint_position_ids(
+                    text_lens_list[i] if packed_batch else L,
+                    gt,
+                    gh,
+                    gw,
+                    device,
+                )
+            )
             for i in range(B)
         ]
         if packed_batch:
@@ -1164,7 +1235,9 @@ class LingBotVideoTransformer3DModel(ModelMixin, ConfigMixin):
         attention_mask = None
         moe_padding_mask = None
         packed_indices = None
-        has_padding = encoder_attention_mask is not None and bool((text_lens < L).any())
+        has_padding = encoder_attention_mask is not None and bool(
+            (prompt_lens < prompt_length).any()
+        )
         if packed_batch or use_packed_attention:
             sample_seq_lens = [n_video + text_len for text_len in text_lens_list]
             cu_seqlens = torch.zeros(B + 1, device=device, dtype=torch.int32)
@@ -1178,9 +1251,21 @@ class LingBotVideoTransformer3DModel(ModelMixin, ConfigMixin):
             }
             has_padding = False
         if has_padding:
+            full_text_mask = torch.cat(
+                (
+                    torch.ones(
+                        B,
+                        additional_length,
+                        dtype=encoder_attention_mask.dtype,
+                        device=device,
+                    ),
+                    encoder_attention_mask,
+                ),
+                dim=1,
+            )
             key_mask = torch.cat(
                 [torch.ones(B, n_video, dtype=torch.bool, device=device),
-                 encoder_attention_mask.bool()],
+                 full_text_mask.bool()],
                 dim=1,
             )
             attention_mask = key_mask[:, None, None, :]      # (B,1,1,S) → SDPA broadcast
@@ -1273,15 +1358,39 @@ class LingBotVideoTransformer3DModel(ModelMixin, ConfigMixin):
         temb6 = temb6.reshape(temb6.shape[0] * temb6.shape[1], -1)
 
         for block in self.blocks:
-            joint = block(
-                joint,
-                temb6,
-                rotary,
-                attention_mask,
-                moe_padding_mask,
-                packed_indices=packed_indices,
-                parallel_config=parallel_config,
-            )
+            if (
+                self.training
+                and self.gradient_checkpointing
+                and packed_indices is None
+                and parallel_config is None
+            ):
+                def custom_forward(hidden, modulation, rotary_positions, current_block=block):
+                    return current_block(
+                        hidden,
+                        modulation,
+                        rotary_positions,
+                        attention_mask,
+                        moe_padding_mask,
+                        packed_indices=None,
+                        parallel_config=None,
+                    )
+
+                joint = self._gradient_checkpointing_func(
+                    custom_forward,
+                    joint,
+                    temb6,
+                    rotary,
+                )
+            else:
+                joint = block(
+                    joint,
+                    temb6,
+                    rotary,
+                    attention_mask,
+                    moe_padding_mask,
+                    packed_indices=packed_indices,
+                    parallel_config=parallel_config,
+                )
         if not packed_cp:
             joint = self.cp_out(joint)
 

@@ -10,6 +10,8 @@
 | [Prompt 准备](prompt_preparation.md) | 把普通 prompt 改写成结构化 JSON caption，并按需生成样本级 negative prompt。 |
 | [Diffusers 推理](dit_inference.md) | 使用 diffusers 路径运行 T2I、T2V、TI2V、Refinement。 |
 | [SGLang Diffusion 推理](sglang_diffusion.md) | 使用 SGLang Diffusion 并行加速推理。 |
+| [长场景训练](long_scene_training.md) | 5000 帧 capture、多新轨迹和 3D 一致性训练。 |
+| [长场景研究设计](long_scene_research.md) | 近期工作分类、方案取舍和必要消融。 |
 
 ## 推荐流程
 
