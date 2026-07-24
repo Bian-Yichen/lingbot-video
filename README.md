@@ -1,5 +1,8 @@
 # LingBot-Video
 
+> Latent spatial memory training for long VIPE-labelled room tours is documented
+> in [docs/zh/latent_spatial_memory_training.md](docs/zh/latent_spatial_memory_training.md).
+
 **🌐 [Project Page](https://technology.robbyant.com/lingbot-video)** | **🤗 [Hugging Face](https://huggingface.co/collections/robbyant/lingbot-video)** | **🤖 [ModelScope](https://www.modelscope.cn/collections/Robbyant/LingBot-Video)** | **📄 [Paper](https://arxiv.org/abs/2607.07675)** | **⚖️ [License](LICENSE)**| **💬 [WeChat 微信 Group](assets/WeChatGroup.JPG)** 
 
 **📘 English Usage**: [English Documentation](docs/en/index.md) \

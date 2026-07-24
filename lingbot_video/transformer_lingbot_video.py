@@ -6,6 +6,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.distributed as dist
+from torch.utils.checkpoint import checkpoint
 
 from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.models.attention_dispatch import dispatch_attention_fn
@@ -162,7 +163,12 @@ class LingBotVideoRotaryEmbedding(nn.Module):
 
 
 def make_joint_position_ids(
-    text_len: int, grid_t: int, grid_h: int, grid_w: int, device: torch.device
+    text_len: int,
+    grid_t: int,
+    grid_h: int,
+    grid_w: int,
+    device: torch.device,
+    video_segment_ids: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """3D positions in [video; text] order. Text t-axis is 1..text_len; video t-axis starts at text_len+1.
 
@@ -170,6 +176,17 @@ def make_joint_position_ids(
     freqs ordered with x first and cap second (same order as cat_interleave).
     """
     tt = torch.arange(grid_t, device=device, dtype=torch.int32) + (text_len + 1)
+    if video_segment_ids is not None:
+        if video_segment_ids.numel() != grid_t:
+            raise ValueError(
+                f"video_segment_ids must contain {grid_t} entries, "
+                f"got {tuple(video_segment_ids.shape)}"
+            )
+        # Keep each semantic segment in a disjoint temporal RoPE range while
+        # preserving ordinary within-segment temporal order.
+        tt = tt + video_segment_ids.reshape(-1).to(device=device, dtype=torch.int32) * (
+            grid_t + 1
+        )
     hh = torch.arange(grid_h, device=device, dtype=torch.int32)
     ww = torch.arange(grid_w, device=device, dtype=torch.int32)
     grid = torch.stack(torch.meshgrid(tt, hh, ww, indexing="ij"), dim=-1).flatten(0, 2)
@@ -966,7 +983,7 @@ class LingBotVideoBlock(nn.Module):
 
 
 class LingBotVideoTransformer3DModel(ModelMixin, ConfigMixin):
-    _supports_gradient_checkpointing = False
+    _supports_gradient_checkpointing = True
     _no_split_modules = ["LingBotVideoBlock"]
     _keep_in_fp32_modules = list(LINGBOT_VIDEO_FP32_MODULES)
 
@@ -1073,6 +1090,7 @@ class LingBotVideoTransformer3DModel(ModelMixin, ConfigMixin):
         self.norm_out = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=norm_eps)
         self.norm_out_modulation = nn.Sequential(nn.SiLU(), nn.Linear(hidden_size, 2 * hidden_size))
         self.proj_out = nn.Linear(hidden_size, math.prod(patch_size) * out_channels)
+        self.gradient_checkpointing = False
         self.cp_joint = nn.Identity()
         self.cp_rotary = nn.Identity()
         self.cp_temb_input = nn.Identity()
@@ -1094,12 +1112,29 @@ class LingBotVideoTransformer3DModel(ModelMixin, ConfigMixin):
             "cp_out": ContextParallelOutput(gather_dim=1, expected_dims=3),
         }
 
+    def _set_gradient_checkpointing(
+        self,
+        enable: bool = True,
+        gradient_checkpointing_func=None,
+    ) -> None:
+        """Diffusers 0.39 gradient-checkpointing hook.
+
+        The callback supplied by ``ModelMixin`` cannot express the keyword-only
+        packed-attention arguments used by LingBot blocks, so forward uses a
+        local closure while this hook owns the public enable/disable state.
+        """
+
+        self.gradient_checkpointing = bool(enable)
+        self._gradient_checkpointing_func = gradient_checkpointing_func
+
     def forward(
         self,
         hidden_states: torch.Tensor,             # (B, C, T, H, W)
         timestep: torch.Tensor,                  # (B,) ∈ [0, 1000](= sigma*1000)
         encoder_hidden_states: torch.Tensor,     # (B, L, text_dim)
         encoder_attention_mask: Optional[torch.Tensor] = None,  # (B, L) 1=valid
+        video_segment_ids: Optional[torch.Tensor] = None,  # (B, T), 0=target,1=preceding,2=reference
+        block_control_residuals: Optional[dict[int, torch.Tensor]] = None,
         return_dict: bool = True,
     ):
         B, C, T, H, W = hidden_states.shape
@@ -1149,8 +1184,25 @@ class LingBotVideoTransformer3DModel(ModelMixin, ConfigMixin):
         joint_seq_len = joint.shape[1]
 
         # Per-sample RoPE: video t-axis start = real text length of this sample + 1
+        if video_segment_ids is not None:
+            if video_segment_ids.shape != (B, T):
+                raise ValueError(
+                    f"video_segment_ids must be {(B, T)}, got {tuple(video_segment_ids.shape)}"
+                )
+            patch_segment_ids = video_segment_ids[:, ::pF]
+        else:
+            patch_segment_ids = None
         rotary_parts = [
-            self.rope(make_joint_position_ids(text_lens_list[i], gt, gh, gw, device))
+            self.rope(
+                make_joint_position_ids(
+                    text_lens_list[i],
+                    gt,
+                    gh,
+                    gw,
+                    device,
+                    None if patch_segment_ids is None else patch_segment_ids[i],
+                )
+            )
             for i in range(B)
         ]
         if packed_batch:
@@ -1272,16 +1324,75 @@ class LingBotVideoTransformer3DModel(ModelMixin, ConfigMixin):
         temb6 = self.cp_temb6(temb6)
         temb6 = temb6.reshape(temb6.shape[0] * temb6.shape[1], -1)
 
-        for block in self.blocks:
-            joint = block(
-                joint,
-                temb6,
-                rotary,
-                attention_mask,
-                moe_padding_mask,
-                packed_indices=packed_indices,
-                parallel_config=parallel_config,
-            )
+        for layer_index, block in enumerate(self.blocks):
+            if self.training and self.gradient_checkpointing and torch.is_grad_enabled():
+                def custom_forward(
+                    current_joint: torch.Tensor,
+                    current_temb6: torch.Tensor,
+                    current_rotary: torch.Tensor,
+                    current_block: LingBotVideoBlock = block,
+                ) -> torch.Tensor:
+                    return current_block(
+                        current_joint,
+                        current_temb6,
+                        current_rotary,
+                        attention_mask,
+                        moe_padding_mask,
+                        packed_indices=packed_indices,
+                        parallel_config=parallel_config,
+                    )
+
+                joint = checkpoint(
+                    custom_forward,
+                    joint,
+                    temb6,
+                    rotary,
+                    use_reentrant=False,
+                )
+            else:
+                joint = block(
+                    joint,
+                    temb6,
+                    rotary,
+                    attention_mask,
+                    moe_padding_mask,
+                    packed_indices=packed_indices,
+                    parallel_config=parallel_config,
+                )
+            if block_control_residuals is not None and layer_index in block_control_residuals:
+                residual = block_control_residuals[layer_index]
+                if residual.shape != (B, n_video, joint.shape[-1]):
+                    raise ValueError(
+                        f"control residual at layer {layer_index} must be "
+                        f"{(B, n_video, joint.shape[-1])}, got {tuple(residual.shape)}"
+                    )
+                if packed_batch:
+                    parts = list(
+                        torch.split(
+                            joint,
+                            [n_video + text_len for text_len in text_lens_list],
+                            dim=1,
+                        )
+                    )
+                    parts = [
+                        torch.cat(
+                            (
+                                part[:, :n_video] + residual[index : index + 1].to(part),
+                                part[:, n_video:],
+                            ),
+                            dim=1,
+                        )
+                        for index, part in enumerate(parts)
+                    ]
+                    joint = torch.cat(parts, dim=1)
+                else:
+                    joint = torch.cat(
+                        (
+                            joint[:, :n_video] + residual.to(joint),
+                            joint[:, n_video:],
+                        ),
+                        dim=1,
+                    )
         if not packed_cp:
             joint = self.cp_out(joint)
 
