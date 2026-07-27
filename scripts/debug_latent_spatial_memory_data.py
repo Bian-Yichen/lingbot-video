@@ -13,7 +13,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
 
 from lingbot_video.latent_spatial_memory.data import (  # noqa: E402
-    RGB_SOURCE_FRAME_STRIDE,
+    SOURCE_FRAME_STRIDE,
     LongTrajectorySampleConfig,
     RcloneConfig,
     RoomTourItemCache,
@@ -170,18 +170,22 @@ def _audit_target_candidates(
 
     print("\n=== MODALITY INDICES ===")
     print(
-        "RGB mapping: VIPE index i -> source RGB index "
-        f"{RGB_SOURCE_FRAME_STRIDE} * i"
+        "Sparse source index s -> internal training index "
+        f"s / {SOURCE_FRAME_STRIDE}; source indices must be divisible by "
+        f"{SOURCE_FRAME_STRIDE}"
     )
-    mapping_examples = [
-        (
-            index,
-            item.rgb_source_index_by_index[index],
-            item.rgb_by_index[index].name,
-        )
-        for index in sorted(item.rgb_by_index)[:12]
-    ]
-    print(f"RGB mapping examples (vipe, source, file): {mapping_examples}")
+    modality_source_indices = {
+        "RGB": item.rgb_source_index_by_index,
+        "depth": item.depth_source_index_by_index,
+        "pose": item.pose_source_index_by_index,
+        "intrinsics": item.intrinsics_source_index_by_index,
+    }
+    for name, source_mapping in modality_source_indices.items():
+        examples = [
+            (internal, source_mapping[internal])
+            for internal in sorted(source_mapping)[:12]
+        ]
+        print(f"{name} mapping examples (internal, source): {examples}")
     _print_index_summary("RGB", rgb)
     _print_index_summary("depth", depth)
     _print_index_summary("pose", pose)
