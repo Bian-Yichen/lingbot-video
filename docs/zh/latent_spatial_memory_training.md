@@ -75,10 +75,11 @@ LingBot 原始发布模型没有 camera-control branch，因此将目标相机�
 
 默认一个 item 的处理方式：
 
-1. VIPE 每 5 个原始视频帧估计一次 depth/pose/intrinsics，因此数据时间轴统一
-   使用连续的 VIPE index：VIPE index `i` 读取原始 `RGB/(5*i)`。原始 RGB
-   帧号不是 5 的倍数时不会下载或建立索引。rclone 一次性下载该 item 中训练
-   需要的最小子集、depth ZIP/shards、pose NPZ、intrinsics NPZ 和 metadata。
+1. VIPE 每 5 个原始视频帧估计一次 depth/pose/intrinsics；RGB 文件名、depth
+   EXR 文件名以及 pose/intrinsics NPZ 的 `inds` 都使用稀疏原始索引
+   `0,5,10,...`。加载器只保留 5 的倍数，并统一映射成连续训练索引
+   `internal=source/5`，所以后续采样逻辑仍处理 `0,1,2,...`。rclone 也只下载
+   对应的稀疏 RGB。
 2. 在节点本地 cache 中保留该 item，默认连续产生 32 个 iteration。
 3. 每次从目标帧之前最长 4096 帧的历史中分层抽取 16/20 个连续 capture clip；
    每个 clip 为 9 RGB，经过 causal VAE 后得到 3 个 temporal latent anchor，
