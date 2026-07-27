@@ -30,10 +30,11 @@ from .geometry import (
 
 logger = logging.getLogger(__name__)
 
-# VIPE estimates depth/pose/intrinsics once every five source RGB frames.  The
-# rest of the training stack operates on the contiguous VIPE timeline, so
-# VIPE index i must read source RGB frame 5 * i.
-RGB_SOURCE_FRAME_STRIDE = 5
+# VIPE estimates depth/pose/intrinsics once every five source RGB frames.  All
+# four modalities store source indices 0,5,10,...; normalize them to the
+# contiguous internal training timeline 0,1,2,... so the rest of the sampler
+# does not need sparse-index special cases.
+SOURCE_FRAME_STRIDE = 5
 
 
 def _is_rclone_remote(path: str) -> bool:
@@ -254,12 +255,24 @@ class LongTrajectorySampleConfig:
             )
 
 
-def _load_npz_mapping(path: Path) -> dict[int, np.ndarray]:
+def _load_npz_mapping(
+    path: Path,
+) -> tuple[dict[int, np.ndarray], dict[int, int]]:
+    output: dict[int, np.ndarray] = {}
+    source_indices: dict[int, int] = {}
     with np.load(path) as payload:
-        return {
-            int(index): np.asarray(value)
-            for index, value in zip(payload["inds"], payload["data"], strict=True)
-        }
+        for index, value in zip(payload["inds"], payload["data"], strict=True):
+            source_index = int(index)
+            if source_index % SOURCE_FRAME_STRIDE:
+                continue
+            internal_index = source_index // SOURCE_FRAME_STRIDE
+            output[internal_index] = np.asarray(value)
+            source_indices[internal_index] = source_index
+    if not output:
+        raise ValueError(
+            f"{path} has no indices divisible by {SOURCE_FRAME_STRIDE}"
+        )
+    return output, source_indices
 
 
 def _decode_exr(payload: bytes) -> np.ndarray:
@@ -302,8 +315,14 @@ class VipeRoomTourItem:
         self.root = Path(root)
         self.metadata = self._load_metadata()
         artifact_root = self.root / "vipe" / "vipe_artifacts"
-        self.pose_by_index = _load_npz_mapping(artifact_root / "pose" / "video.npz")
-        self.intrinsics_by_index = _load_npz_mapping(
+        (
+            self.pose_by_index,
+            self.pose_source_index_by_index,
+        ) = _load_npz_mapping(artifact_root / "pose" / "video.npz")
+        (
+            self.intrinsics_by_index,
+            self.intrinsics_source_index_by_index,
+        ) = _load_npz_mapping(
             artifact_root / "intrinsics" / "video.npz"
         )
         self._validate_camera_type(artifact_root / "intrinsics" / "video_camera.txt")
@@ -311,7 +330,10 @@ class VipeRoomTourItem:
             self.rgb_by_index,
             self.rgb_source_index_by_index,
         ) = self._index_rgb()
-        self.depth_location = self._index_depth(artifact_root / "depth")
+        (
+            self.depth_location,
+            self.depth_source_index_by_index,
+        ) = self._index_depth(artifact_root / "depth")
         self._depth_cache: dict[int, np.ndarray] = {}
         self._depth_cache_order: list[int] = []
         self._depth_cache_limit = 128
@@ -348,20 +370,22 @@ class VipeRoomTourItem:
                 source_index = int(path.stem)
             except ValueError:
                 continue
-            if source_index % RGB_SOURCE_FRAME_STRIDE:
+            if source_index % SOURCE_FRAME_STRIDE:
                 continue
-            vipe_index = source_index // RGB_SOURCE_FRAME_STRIDE
-            output[vipe_index] = path
-            source_indices[vipe_index] = source_index
+            internal_index = source_index // SOURCE_FRAME_STRIDE
+            output[internal_index] = path
+            source_indices[internal_index] = source_index
         if not output:
             raise FileNotFoundError(
-                f"no RGB frames divisible by {RGB_SOURCE_FRAME_STRIDE} below "
+                f"no RGB frames divisible by {SOURCE_FRAME_STRIDE} below "
                 f"{self.root / 'RGB'}"
             )
         return output, source_indices
 
     @staticmethod
-    def _index_depth(depth_root: Path) -> dict[int, tuple[Path, str]]:
+    def _index_depth(
+        depth_root: Path,
+    ) -> tuple[dict[int, tuple[Path, str]], dict[int, int]]:
         final_archive = depth_root / "video.zip"
         archives: list[Path] = []
         if final_archive.is_file():
@@ -370,20 +394,25 @@ class VipeRoomTourItem:
         if parts.is_dir():
             archives.extend(sorted(parts.glob("*.zip")))
         output: dict[int, tuple[Path, str]] = {}
+        source_indices: dict[int, int] = {}
         for archive_path in archives:
             try:
                 with zipfile.ZipFile(archive_path, "r") as archive:
                     for member in archive.namelist():
                         try:
-                            frame_index = int(Path(member).stem)
+                            source_index = int(Path(member).stem)
                         except ValueError:
                             continue
-                        output.setdefault(frame_index, (archive_path, member))
+                        if source_index % SOURCE_FRAME_STRIDE:
+                            continue
+                        internal_index = source_index // SOURCE_FRAME_STRIDE
+                        output.setdefault(internal_index, (archive_path, member))
+                        source_indices.setdefault(internal_index, source_index)
             except zipfile.BadZipFile:
                 logger.warning("ignoring incomplete depth archive %s", archive_path)
         if not output:
             raise FileNotFoundError(f"no complete depth frames below {depth_root}")
-        return output
+        return output, source_indices
 
     @property
     def source_hw(self) -> tuple[int, int]:
