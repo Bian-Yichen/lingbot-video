@@ -12,7 +12,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
 
 from lingbot_video.latent_spatial_memory.data import (  # noqa: E402
-    RGB_SOURCE_FRAME_STRIDE,
+    SOURCE_FRAME_STRIDE,
     LongTrajectorySampleConfig,
     RcloneConfig,
     RoomTourItemCache,
@@ -62,20 +62,22 @@ def main() -> None:
     item_name = args.item_name or cache.list_items()[0]
     item = VipeRoomTourItem(cache.materialize(item_name))
     print(
-        "RGB mapping: VIPE index i -> source RGB index "
-        f"{RGB_SOURCE_FRAME_STRIDE} * i"
+        "Sparse RGB/depth/pose/intrinsics source index s -> internal index "
+        f"s / {SOURCE_FRAME_STRIDE}"
     )
-    print(
-        "RGB mapping examples:",
-        [
-            (
-                index,
-                item.rgb_source_index_by_index[index],
-                item.rgb_by_index[index].name,
-            )
-            for index in sorted(item.rgb_by_index)[:12]
-        ],
-    )
+    for name, source_mapping in {
+        "RGB": item.rgb_source_index_by_index,
+        "depth": item.depth_source_index_by_index,
+        "pose": item.pose_source_index_by_index,
+        "intrinsics": item.intrinsics_source_index_by_index,
+    }.items():
+        print(
+            f"{name} mapping examples:",
+            [
+                (internal, source_mapping[internal])
+                for internal in sorted(source_mapping)[:12]
+            ],
+        )
     config = LongTrajectorySampleConfig(
         height=args.height,
         width=args.width,
