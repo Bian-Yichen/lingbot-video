@@ -9,16 +9,10 @@ import torch.distributed as dist
 from torch.utils.checkpoint import checkpoint
 
 from diffusers.configuration_utils import ConfigMixin, register_to_config
-from diffusers.models.attention_dispatch import dispatch_attention_fn
 from diffusers.models._modeling_parallel import ContextParallelInput, ContextParallelOutput
 from diffusers.models.embeddings import TimestepEmbedding, Timesteps
 from diffusers.models.modeling_outputs import Transformer2DModelOutput
 from diffusers.models.modeling_utils import ModelMixin
-
-try:
-    from flash_attn_interface import flash_attn_varlen_func as flash_attn_varlen_func_v3
-except Exception:  # pragma: no cover - optional CUDA kernel.
-    flash_attn_varlen_func_v3 = None
 
 try:
     from .moe_pack_kernels import reorder_tokens_triton_pack
@@ -95,6 +89,66 @@ def _all_to_all_split_cat(
     output_list = [torch.empty_like(input_list[0]) for _ in range(world_size)]
     dist.all_to_all(output_list, input_list, group=group)
     return torch.cat(output_list, dim=gather_dim).contiguous()
+
+
+def _sdpa(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    attention_mask: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """PyTorch SDPA for LingBot's ``[B, S, H, D]`` attention layout."""
+
+    output = F.scaled_dot_product_attention(
+        q.transpose(1, 2),
+        k.transpose(1, 2),
+        v.transpose(1, 2),
+        attn_mask=attention_mask,
+        dropout_p=0.0,
+        is_causal=False,
+    )
+    return output.transpose(1, 2).contiguous()
+
+
+def _packed_sdpa(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+) -> torch.Tensor:
+    """Variable-length self-attention using only PyTorch SDPA.
+
+    The LingBot batching path packs samples into one physical sequence.  Running
+    ordinary dense attention over that sequence would leak information between
+    samples, so each interval from ``cu_seqlens`` is evaluated independently.
+    This is deliberately a small Python loop: the number of packed samples is
+    tiny during training, it works on CUDA through the native SDPA kernels, and
+    it removes the FlashAttention-3 build/runtime dependency entirely.
+    """
+
+    if q.shape != k.shape or q.shape != v.shape:
+        raise ValueError("packed SDPA requires equal q/k/v shapes")
+    flat_q = q.reshape(-1, q.shape[-2], q.shape[-1])
+    flat_k = k.reshape_as(flat_q)
+    flat_v = v.reshape_as(flat_q)
+    offsets = cu_seqlens.detach().to(device="cpu", dtype=torch.int64).tolist()
+    if len(offsets) < 2 or offsets[0] != 0 or offsets[-1] != flat_q.shape[0]:
+        raise ValueError(
+            "cu_seqlens must start at zero and end at the packed token count; "
+            f"got {offsets[:1]}..{offsets[-1:]}, tokens={flat_q.shape[0]}"
+        )
+    outputs = []
+    for start, stop in zip(offsets[:-1], offsets[1:], strict=True):
+        if stop <= start:
+            raise ValueError(f"packed SDPA received an empty segment [{start}, {stop})")
+        outputs.append(
+            _sdpa(
+                flat_q[start:stop].unsqueeze(0),
+                flat_k[start:stop].unsqueeze(0),
+                flat_v[start:stop].unsqueeze(0),
+            )[0]
+        )
+    return torch.cat(outputs, dim=0).reshape_as(q)
 
 
 class LingBotVideoRMSNorm(nn.Module):
@@ -265,31 +319,20 @@ class LingBotVideoAttention(nn.Module):
             v = self.to_v(x).unflatten(2, (self.num_heads, self.head_dim))
         q = apply_rotary_emb(self.norm_q(q), rotary_emb)
         k = apply_rotary_emb(self.norm_k(k), rotary_emb)
-        # dispatch_attention_fn expects (B, S, H, D) in and out (same as the diffusers Wan processor)
         if packed_indices is None:
-            out = dispatch_attention_fn(
-                q,
-                k,
-                v,
-                attn_mask=attention_mask,
-                parallel_config=parallel_config,
-            )
-        else:
-            if flash_attn_varlen_func_v3 is None:
-                raise RuntimeError("flash_attn_interface.flash_attn_varlen_func is required.")
-            if parallel_config is None:
-                result = flash_attn_varlen_func_v3(
-                    q=q.reshape(-1, self.num_heads, self.head_dim),
-                    k=k.reshape(-1, self.num_heads, self.head_dim),
-                    v=v.reshape(-1, self.num_heads, self.head_dim),
-                    cu_seqlens_q=packed_indices["cu_seqlens_kv"],
-                    cu_seqlens_k=packed_indices["cu_seqlens_kv"],
-                    max_seqlen_q=packed_indices["max_seqlen_in_batch_kv"],
-                    max_seqlen_k=packed_indices["max_seqlen_in_batch_kv"],
-                    causal=False,
+            if parallel_config is not None:
+                raise RuntimeError(
+                    "context parallel attention must provide packed_indices"
                 )
-                out = result[0] if isinstance(result, tuple) else result
-                out = out.reshape(B, S, self.num_heads, self.head_dim)
+            out = _sdpa(q, k, v, attention_mask)
+        else:
+            if parallel_config is None:
+                out = _packed_sdpa(
+                    q,
+                    k,
+                    v,
+                    packed_indices["cu_seqlens_kv"],
+                )
             else:
                 group = parallel_config.context_parallel_config._ulysses_mesh.get_group()
                 world_size = dist.get_world_size(group)
@@ -312,20 +355,12 @@ class LingBotVideoAttention(nn.Module):
                     gather_dim=1,
                     group=group,
                 ).view(B, S * world_size, local_heads, self.head_dim)
-                q_flat = q_global.reshape(-1, local_heads, self.head_dim)
-                k_flat = k_global.reshape(-1, local_heads, self.head_dim)
-                v_flat = v_global.reshape(-1, local_heads, self.head_dim)
-                result = flash_attn_varlen_func_v3(
-                    q=q_flat,
-                    k=k_flat,
-                    v=v_flat,
-                    cu_seqlens_q=packed_indices["cu_seqlens_kv"],
-                    cu_seqlens_k=packed_indices["cu_seqlens_kv"],
-                    max_seqlen_q=packed_indices["max_seqlen_in_batch_kv"],
-                    max_seqlen_k=packed_indices["max_seqlen_in_batch_kv"],
-                    causal=False,
+                out_global = _packed_sdpa(
+                    q_global,
+                    k_global,
+                    v_global,
+                    packed_indices["cu_seqlens_kv"],
                 )
-                out_global = result[0] if isinstance(result, tuple) else result
                 out_global = out_global.reshape(B, S * world_size, local_heads * self.head_dim)
                 out = _all_to_all_split_cat(
                     out_global,
@@ -1130,11 +1165,12 @@ class LingBotVideoTransformer3DModel(ModelMixin, ConfigMixin):
     def forward(
         self,
         hidden_states: torch.Tensor,             # (B, C, T, H, W)
-        timestep: torch.Tensor,                  # (B,) ∈ [0, 1000](= sigma*1000)
+        timestep: torch.Tensor,                  # (B,) or (B,T), in [0,1000]
         encoder_hidden_states: torch.Tensor,     # (B, L, text_dim)
         encoder_attention_mask: Optional[torch.Tensor] = None,  # (B, L) 1=valid
         video_segment_ids: Optional[torch.Tensor] = None,  # (B, T), 0=target,1=preceding,2=reference
         block_control_residuals: Optional[dict[int, torch.Tensor]] = None,
+        block_control_frame_range: Optional[tuple[int, int]] = None,
         return_dict: bool = True,
     ):
         B, C, T, H, W = hidden_states.shape
@@ -1285,37 +1321,83 @@ class LingBotVideoTransformer3DModel(ModelMixin, ConfigMixin):
                 )
                 joint_seq_len = joint.shape[1]
 
-        timestep_for_embed = timestep.float()
-        timestep_proj = self.time_proj(timestep_for_embed)
-        t_emb = self.time_embedder(timestep_proj)                            # (B, D)
+        timestep_text_lens = text_lens_list if packed_batch else [L] * B
+        if timestep.ndim == 1:
+            if timestep.shape != (B,):
+                raise ValueError(f"timestep must be {(B,)}, got {tuple(timestep.shape)}")
+            timestep_proj = self.time_proj(timestep.float())
+            sample_t_emb = self.time_embedder(timestep_proj)
+            token_t_emb = [
+                sample_t_emb[index : index + 1].expand(
+                    n_video + timestep_text_lens[index],
+                    -1,
+                )
+                for index in range(B)
+            ]
+        elif timestep.ndim == 2:
+            if timestep.shape != (B, T):
+                raise ValueError(
+                    f"frame-wise timestep must be {(B, T)}, got {tuple(timestep.shape)}"
+                )
+            patch_timestep = timestep[:, ::pF].float()
+            if patch_timestep.shape[1] != gt:
+                raise ValueError("frame-wise timesteps do not align with temporal patches")
+            video_timestep = patch_timestep[:, :, None].expand(
+                B,
+                gt,
+                gh * gw,
+            ).reshape(B, n_video)
+            # LingBot jointly self-attends text and video.  Clean reference and
+            # preceding frames get timestep zero; text uses the sample's largest
+            # target timestep, the closest analogue to Wan's cross-attention
+            # context, which has no independent diffusion timestep.
+            text_timestep = patch_timestep.amax(dim=1, keepdim=True)
+            token_timesteps = [
+                torch.cat(
+                    (
+                        video_timestep[index],
+                        text_timestep[index].expand(timestep_text_lens[index]),
+                    )
+                )
+                for index in range(B)
+            ]
+            flat_timesteps = torch.cat(token_timesteps)
+            flat_t_emb = self.time_embedder(self.time_proj(flat_timesteps))
+            token_t_emb = list(
+                torch.split(
+                    flat_t_emb,
+                    [n_video + text_len for text_len in timestep_text_lens],
+                    dim=0,
+                )
+            )
+        else:
+            raise ValueError(
+                f"timestep must be [B] or [B,T], got {tuple(timestep.shape)}"
+            )
+
         if packed_batch:
+            temb_input = torch.cat(token_t_emb, dim=0).unsqueeze(0)
+        else:
+            if len(set(text_lens_list)) != 1:
+                raise RuntimeError("unpacked timestep embedding requires equal text lengths")
+            temb_input = torch.stack(token_t_emb, dim=0)
+        if padding_size:
             temb_input = torch.cat(
                 [
-                    t_emb[i : i + 1].unsqueeze(1).expand(1, n_video + text_lens_list[i], -1)
-                    for i in range(B)
+                    temb_input,
+                    torch.zeros(
+                        temb_input.shape[0],
+                        padding_size,
+                        temb_input.shape[2],
+                        device=temb_input.device,
+                        dtype=temb_input.dtype,
+                    ),
                 ],
                 dim=1,
             )
-            if padding_size:
-                temb_input = torch.cat(
-                    [
-                        temb_input,
-                        torch.zeros(
-                            temb_input.shape[0],
-                            padding_size,
-                            temb_input.shape[2],
-                            device=temb_input.device,
-                            dtype=temb_input.dtype,
-                        ),
-                    ],
-                    dim=1,
-                )
-            temb6 = self.time_modulation(temb_input.reshape(joint_seq_len, -1))
-            temb6 = temb6.reshape(1, joint_seq_len, -1)
-        else:
-            temb_input = t_emb.unsqueeze(1).expand(B, joint_seq_len, -1)       # (B, S, D)
-            temb6 = self.time_modulation(temb_input.reshape(B * joint_seq_len, -1))
-            temb6 = temb6.reshape(B, joint_seq_len, -1)                        # (B, S, 6D)
+        temb6 = self.time_modulation(
+            temb_input.reshape(temb_input.shape[0] * temb_input.shape[1], -1)
+        ).reshape(temb_input.shape[0], temb_input.shape[1], -1)
 
         joint = self.cp_joint(joint)
         rotary = self.cp_rotary(rotary)
@@ -1361,10 +1443,26 @@ class LingBotVideoTransformer3DModel(ModelMixin, ConfigMixin):
                 )
             if block_control_residuals is not None and layer_index in block_control_residuals:
                 residual = block_control_residuals[layer_index]
-                if residual.shape != (B, n_video, joint.shape[-1]):
+                if block_control_frame_range is None:
+                    control_start, control_stop = 0, T
+                else:
+                    control_start, control_stop = block_control_frame_range
+                if not (0 <= control_start < control_stop <= T):
+                    raise ValueError(
+                        "block_control_frame_range must be a non-empty range within "
+                        f"[0,{T}], got {(control_start, control_stop)}"
+                    )
+                if control_start % pF or control_stop % pF:
+                    raise ValueError(
+                        "control frame range must align to the temporal patch size"
+                    )
+                token_start = control_start // pF * gh * gw
+                token_stop = control_stop // pF * gh * gw
+                control_tokens = token_stop - token_start
+                if residual.shape != (B, control_tokens, joint.shape[-1]):
                     raise ValueError(
                         f"control residual at layer {layer_index} must be "
-                        f"{(B, n_video, joint.shape[-1])}, got {tuple(residual.shape)}"
+                        f"{(B, control_tokens, joint.shape[-1])}, got {tuple(residual.shape)}"
                     )
                 if packed_batch:
                     parts = list(
@@ -1377,8 +1475,10 @@ class LingBotVideoTransformer3DModel(ModelMixin, ConfigMixin):
                     parts = [
                         torch.cat(
                             (
-                                part[:, :n_video] + residual[index : index + 1].to(part),
-                                part[:, n_video:],
+                                part[:, :token_start],
+                                part[:, token_start:token_stop]
+                                + residual[index : index + 1].to(part),
+                                part[:, token_stop:],
                             ),
                             dim=1,
                         )
@@ -1388,8 +1488,9 @@ class LingBotVideoTransformer3DModel(ModelMixin, ConfigMixin):
                 else:
                     joint = torch.cat(
                         (
-                            joint[:, :n_video] + residual.to(joint),
-                            joint[:, n_video:],
+                            joint[:, :token_start],
+                            joint[:, token_start:token_stop] + residual.to(joint),
+                            joint[:, token_stop:],
                         ),
                         dim=1,
                     )

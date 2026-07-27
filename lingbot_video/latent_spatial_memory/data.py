@@ -195,10 +195,12 @@ class RoomTourItemCache:
 class LongTrajectorySampleConfig:
     height: int = 480
     width: int = 832
-    capture_frames: int = 48
+    capture_clips: int = 16
+    capture_clip_rgb_frames: int = 9
+    preceding_rgb_frames: int = 8
+    reference_frames: int = 4
     history_min_frames: int = 256
     history_max_frames: int = 4096
-    rollout_chunks: int = 2
     latent_frames_per_chunk: int = 9
     vae_temporal_stride: int = 4
     samples_per_item: int = 32
@@ -207,12 +209,37 @@ class LongTrajectorySampleConfig:
     max_sample_attempts: int = 64
 
     @property
-    def total_latent_frames(self) -> int:
-        return 1 + self.rollout_chunks * (self.latent_frames_per_chunk - 1)
+    def capture_latent_frames_per_clip(self) -> int:
+        return 1 + (
+            self.capture_clip_rgb_frames - 1
+        ) // self.vae_temporal_stride
 
     @property
     def target_rgb_frames(self) -> int:
-        return 1 + (self.total_latent_frames - 1) * self.vae_temporal_stride
+        return 1 + (
+            self.latent_frames_per_chunk - 1
+        ) * self.vae_temporal_stride
+
+    def validate(self) -> None:
+        if self.capture_clips < 1:
+            raise ValueError("capture_clips must be positive")
+        if self.reference_frames < 0:
+            raise ValueError("reference_frames must be non-negative")
+        if self.preceding_rgb_frames < 1:
+            raise ValueError("preceding_rgb_frames must be positive")
+        if (self.capture_clip_rgb_frames - 1) % self.vae_temporal_stride:
+            raise ValueError(
+                "capture_clip_rgb_frames must equal 1 + k * vae_temporal_stride"
+            )
+        if self.preceding_rgb_frames % self.vae_temporal_stride:
+            raise ValueError(
+                "preceding_rgb_frames must be divisible by vae_temporal_stride"
+            )
+        if self.capture_clip_rgb_frames != self.preceding_rgb_frames + 1:
+            raise ValueError(
+                "the final capture clip must contain preceding_rgb_frames + "
+                "the clean target overlap frame"
+            )
 
 
 def _load_npz_mapping(path: Path) -> dict[int, np.ndarray]:
@@ -387,31 +414,91 @@ class VipeRoomTourItem:
         )
 
     def _candidate_target_starts(self, config: LongTrajectorySampleConfig) -> list[int]:
+        config.validate()
         rgb = set(self.rgb_by_index)
         calibration = set(self.pose_by_index) & set(self.intrinsics_by_index)
         depth = set(self.depth_location)
-        available_capture = sorted(rgb & calibration & depth)
-        if not available_capture:
+        geometry = calibration & depth
+        available = sorted(rgb & geometry)
+        if not available:
             return []
-        target_rgb_offsets = range(config.target_rgb_frames)
-        target_latent_offsets = range(
-            0,
-            config.target_rgb_frames,
-            config.vae_temporal_stride,
+        target_rgb_offsets = tuple(range(config.target_rgb_frames))
+        target_latent_offsets = tuple(
+            range(0, config.target_rgb_frames, config.vae_temporal_stride)
+        )
+        preceding_rgb_offsets = tuple(range(-config.preceding_rgb_frames, 0))
+        preceding_latent_offsets = tuple(
+            range(
+                -config.preceding_rgb_frames,
+                0,
+                config.vae_temporal_stride,
+            )
+        )
+        final_capture_start_offset = 1 - config.capture_clip_rgb_frames
+        capture_anchor_offsets = tuple(
+            range(
+                final_capture_start_offset,
+                1,
+                config.vae_temporal_stride,
+            )
         )
         candidates: list[int] = []
-        for start in available_capture:
-            if start - available_capture[0] < config.history_min_frames:
+        for start in available:
+            if start - available[0] < config.history_min_frames:
                 continue
             if not all(start + offset in rgb for offset in target_rgb_offsets):
                 continue
+            if not all(start + offset in rgb for offset in preceding_rgb_offsets):
+                continue
+            if not all(start + offset in geometry for offset in target_latent_offsets):
+                continue
+            if not all(start + offset in geometry for offset in preceding_latent_offsets):
+                continue
             if not all(
-                start + offset in calibration and start + offset in depth
-                for offset in target_latent_offsets
+                start + offset in rgb
+                for offset in range(
+                    final_capture_start_offset,
+                    1,
+                )
             ):
+                continue
+            if not all(start + offset in geometry for offset in capture_anchor_offsets):
                 continue
             candidates.append(start)
         return candidates
+
+    def _valid_capture_clip_starts(
+        self,
+        *,
+        history_start: int,
+        target_start: int,
+        config: LongTrajectorySampleConfig,
+    ) -> list[int]:
+        rgb = set(self.rgb_by_index)
+        geometry = (
+            set(self.pose_by_index)
+            & set(self.intrinsics_by_index)
+            & set(self.depth_location)
+        )
+        anchor_offsets = tuple(
+            range(
+                0,
+                config.capture_clip_rgb_frames,
+                config.vae_temporal_stride,
+            )
+        )
+        latest_start = target_start - config.capture_clip_rgb_frames + 1
+        starts = []
+        for start in range(history_start, latest_start + 1):
+            if not all(
+                start + offset in rgb
+                for offset in range(config.capture_clip_rgb_frames)
+            ):
+                continue
+            if not all(start + offset in geometry for offset in anchor_offsets):
+                continue
+            starts.append(start)
+        return starts
 
     @staticmethod
     def _stratified_capture_indices(
@@ -441,7 +528,7 @@ class VipeRoomTourItem:
         starts = self._candidate_target_starts(config)
         if not starts:
             raise RuntimeError(f"{self.root.name} has no valid long-trajectory training window")
-        available_capture = sorted(
+        available = sorted(
             set(self.rgb_by_index)
             & set(self.pose_by_index)
             & set(self.intrinsics_by_index)
@@ -450,45 +537,81 @@ class VipeRoomTourItem:
         target_start = rng.choice(starts)
         maximum_history = min(
             config.history_max_frames,
-            target_start - available_capture[0],
+            target_start - available[0],
         )
         minimum_history = min(config.history_min_frames, maximum_history)
         history_span = rng.randint(minimum_history, maximum_history)
         history_start = target_start - history_span
-        history_candidates = [
-            index
-            for index in available_capture
-            if history_start <= index <= target_start
-        ]
-        if target_start not in history_candidates:
-            history_candidates.append(target_start)
-            history_candidates.sort()
-        capture_indices = self._stratified_capture_indices(
-            history_candidates,
-            config.capture_frames,
+        capture_start_candidates = self._valid_capture_clip_starts(
+            history_start=history_start,
+            target_start=target_start,
+            config=config,
         )
-        # The final capture is the clean one-latent overlap of the first chunk.
-        if capture_indices[-1] != target_start:
-            capture_indices[-1] = target_start
-            capture_indices = sorted(set(capture_indices))
-            if len(capture_indices) != config.capture_frames:
-                capture_indices = self._stratified_capture_indices(
-                    history_candidates[:-1],
-                    config.capture_frames - 1,
-                ) + [target_start]
+        final_capture_start = target_start - config.capture_clip_rgb_frames + 1
+        if final_capture_start not in capture_start_candidates:
+            raise RuntimeError("the target overlap capture clip is incomplete")
+        if len(capture_start_candidates) < config.capture_clips:
+            raise RuntimeError(
+                f"only {len(capture_start_candidates)} valid capture clips for "
+                f"requested {config.capture_clips}"
+            )
+        capture_clip_starts = self._stratified_capture_indices(
+            capture_start_candidates,
+            config.capture_clips,
+        )
+        if capture_clip_starts[-1] != final_capture_start:
+            capture_clip_starts = self._stratified_capture_indices(
+                capture_start_candidates[:-1],
+                config.capture_clips - 1,
+            ) + [final_capture_start]
+
+        capture_anchor_offsets = tuple(
+            range(
+                0,
+                config.capture_clip_rgb_frames,
+                config.vae_temporal_stride,
+            )
+        )
+        capture_indices = [
+            start + offset
+            for start in capture_clip_starts
+            for offset in capture_anchor_offsets
+        ]
 
         target_rgb_indices = list(
             range(target_start, target_start + config.target_rgb_frames)
         )
         target_latent_indices = target_rgb_indices[:: config.vae_temporal_stride]
+        preceding_rgb_indices = list(
+            range(target_start - config.preceding_rgb_frames, target_start)
+        )
+        preceding_latent_indices = preceding_rgb_indices[
+            :: config.vae_temporal_stride
+        ]
         target_hw = (config.height, config.width)
         source_hw = self.source_hw
 
         capture_rgb = torch.stack(
-            [self.read_rgb(index, target_hw) for index in capture_indices]
+            [
+                torch.stack(
+                    [
+                        self.read_rgb(start + offset, target_hw)
+                        for offset in range(config.capture_clip_rgb_frames)
+                    ],
+                    dim=1,
+                )
+                for start in capture_clip_starts
+            ]
         )
         capture_depth = torch.stack(
             [self.read_depth(index, target_hw) for index in capture_indices]
+        )
+        preceding_rgb = torch.stack(
+            [self.read_rgb(index, target_hw) for index in preceding_rgb_indices],
+            dim=1,
+        )
+        preceding_depth = torch.stack(
+            [self.read_depth(index, target_hw) for index in preceding_latent_indices]
         )
         target_rgb = torch.stack(
             [self.read_rgb(index, target_hw) for index in target_rgb_indices],
@@ -498,24 +621,49 @@ class VipeRoomTourItem:
             [self.read_depth(index, target_hw) for index in target_latent_indices]
         )
 
-        capture_c2w = torch.from_numpy(
+        capture_c2w_raw = torch.from_numpy(
             np.stack([self.pose_by_index[index] for index in capture_indices])
+        ).float()
+        preceding_c2w_raw = torch.from_numpy(
+            np.stack([self.pose_by_index[index] for index in preceding_latent_indices])
         ).float()
         target_c2w = torch.from_numpy(
             np.stack([self.pose_by_index[index] for index in target_latent_indices])
         ).float()
-        first_capture = capture_c2w[0]
-        capture_c2w = normalize_c2w_to_first_capture(capture_c2w, first_capture)
+        first_capture = capture_c2w_raw[0]
+        capture_c2w = normalize_c2w_to_first_capture(
+            capture_c2w_raw,
+            first_capture,
+        )
+        preceding_c2w = normalize_c2w_to_first_capture(
+            preceding_c2w_raw,
+            first_capture,
+        )
         target_c2w = normalize_c2w_to_first_capture(target_c2w, first_capture)
 
         capture_intrinsics_vector = torch.from_numpy(
             np.stack([self.intrinsics_by_index[index] for index in capture_indices])
+        ).float()
+        preceding_intrinsics_vector = torch.from_numpy(
+            np.stack(
+                [
+                    self.intrinsics_by_index[index]
+                    for index in preceding_latent_indices
+                ]
+            )
         ).float()
         target_intrinsics_vector = torch.from_numpy(
             np.stack([self.intrinsics_by_index[index] for index in target_latent_indices])
         ).float()
         capture_intrinsics = intrinsics_vector_to_matrix(
             resize_crop_intrinsics(capture_intrinsics_vector, source_hw, target_hw)
+        )
+        preceding_intrinsics = intrinsics_vector_to_matrix(
+            resize_crop_intrinsics(
+                preceding_intrinsics_vector,
+                source_hw,
+                target_hw,
+            )
         )
         target_intrinsics = intrinsics_vector_to_matrix(
             resize_crop_intrinsics(target_intrinsics_vector, source_hw, target_hw)
@@ -526,11 +674,41 @@ class VipeRoomTourItem:
             & (capture_depth >= config.min_depth)
             & (capture_depth <= config.max_depth)
         )
+        preceding_valid = (
+            torch.isfinite(preceding_depth)
+            & (preceding_depth >= config.min_depth)
+            & (preceding_depth <= config.max_depth)
+        )
         target_valid = (
             torch.isfinite(target_depth)
             & (target_depth >= config.min_depth)
             & (target_depth <= config.max_depth)
         )
+
+        reference_candidates = [
+            index
+            for index in available
+            if history_start <= index < target_start
+        ]
+        reference_indices = (
+            self._stratified_capture_indices(
+                reference_candidates,
+                config.reference_frames,
+            )
+            if config.reference_frames
+            else []
+        )
+        if reference_indices:
+            reference_rgb = torch.stack(
+                [self.read_rgb(index, target_hw) for index in reference_indices]
+            )
+        else:
+            reference_rgb = torch.empty(
+                0,
+                3,
+                target_hw[0],
+                target_hw[1],
+            )
         return {
             "item_name": self.root.name,
             "capture_rgb": capture_rgb,
@@ -539,6 +717,28 @@ class VipeRoomTourItem:
             "capture_c2w": capture_c2w,
             "capture_intrinsics": capture_intrinsics,
             "capture_indices": torch.tensor(capture_indices, dtype=torch.long),
+            "capture_clip_starts": torch.tensor(
+                capture_clip_starts,
+                dtype=torch.long,
+            ),
+            "preceding_rgb": preceding_rgb,
+            "preceding_depth": preceding_depth,
+            "preceding_valid": preceding_valid,
+            "preceding_c2w": preceding_c2w,
+            "preceding_intrinsics": preceding_intrinsics,
+            "preceding_rgb_indices": torch.tensor(
+                preceding_rgb_indices,
+                dtype=torch.long,
+            ),
+            "preceding_latent_indices": torch.tensor(
+                preceding_latent_indices,
+                dtype=torch.long,
+            ),
+            "reference_rgb": reference_rgb,
+            "reference_indices": torch.tensor(
+                reference_indices,
+                dtype=torch.long,
+            ),
             "target_rgb": target_rgb,
             "target_depth": target_depth,
             "target_valid": target_valid,

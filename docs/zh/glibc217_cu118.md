@@ -9,7 +9,7 @@
 - 单卡 Diffusers backend
 - Dense 1.3B 的 T2V、TI2V、T2I
 
-高级能力（FSDP2、context parallel、SGLang native、packed/batched CFG、FlashAttention 3）不属于该兼容路径。
+高级能力（FSDP2、context parallel、SGLang native）不属于该兼容路径。
 
 ## 1. 切换分支
 
@@ -100,6 +100,8 @@ infer_schema(func): Parameter q has unsupported type torch.Tensor
 单卡脚本还做了两项降级：
 
 1. Qwen3-VL text encoder 使用 PyTorch SDPA，而不是 FlashAttention 3。
-2. 不启用 `--batch_cfg`，CFG 改为正负条件各运行一次 Transformer，避免 B>1 的 packed FlashAttention 路径。
+2. Transformer 的普通和 packed attention 均使用 PyTorch SDPA，不依赖
+   FlashAttention 3；兼容脚本仍默认关闭 `--batch_cfg` 以降低显存峰值。
 
-因此生成速度会比官方 Torch 2.12 + FlashAttention 3 环境慢，但更适合老系统快速跑通模型。
+因此生成速度可能低于专用 fused attention kernel，但不需要编译额外 CUDA 扩展，
+更适合老系统直接运行。

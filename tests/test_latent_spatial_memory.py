@@ -67,6 +67,41 @@ def test_same_view_memory_readout_recovers_latent_cells() -> None:
     )
     assert bool((readout.visibility == 1).all())
     torch.testing.assert_close(readout.features[:, 0], latent)
+
+
+def test_same_depth_readout_prefers_latest_memory_update() -> None:
+    height, width = 3, 4
+    depth = torch.ones(height, width)
+    intrinsics = torch.tensor(
+        [[4.0, 0.0, 1.5], [0.0, 4.0, 1.0], [0.0, 0.0, 1.0]]
+    )
+    c2w = torch.eye(4)
+    memory = LatentSpatialMemory(
+        2,
+        device=torch.device("cpu"),
+        feature_dtype=torch.float32,
+        voxel_size=0,
+    )
+    memory.write(
+        torch.zeros(2, height, width),
+        depth,
+        intrinsics,
+        c2w,
+        image_hw=(height, width),
+        frame_id=3,
+    )
+    latest = torch.ones(2, height, width)
+    memory.write(
+        latest,
+        depth,
+        intrinsics,
+        c2w,
+        image_hw=(height, width),
+        frame_id=9,
+    )
+
+    readout = memory.read(c2w, intrinsics, (height, width))
+    torch.testing.assert_close(readout.features[:, 0], latest)
     torch.testing.assert_close(readout.depth[0, 0], depth)
 
 

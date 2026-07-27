@@ -71,10 +71,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--prompt", default="An indoor room tour.")
     parser.add_argument("--height", type=int, default=480)
     parser.add_argument("--width", type=int, default=832)
-    parser.add_argument("--capture_frames", type=int, default=48)
+    parser.add_argument("--capture_clips", type=int, default=16)
+    parser.add_argument("--capture_clip_rgb_frames", type=int, default=9)
+    parser.add_argument("--preceding_rgb_frames", type=int, default=8)
+    parser.add_argument("--reference_frames", type=int, default=4)
     parser.add_argument("--history_min_frames", type=int, default=256)
     parser.add_argument("--history_max_frames", type=int, default=4096)
-    parser.add_argument("--rollout_chunks", type=int, default=2)
     parser.add_argument("--latent_frames_per_chunk", type=int, default=9)
     parser.add_argument("--samples_per_item", type=int, default=32)
     parser.add_argument("--min_depth", type=float, default=0.1)
@@ -84,10 +86,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--memory_max_points", type=int, default=750_000)
     parser.add_argument("--memory_voxel_size", type=float, default=0.0)
     parser.add_argument("--teacher_memory_probability", type=float, default=0.5)
+    parser.add_argument("--memory_update_noise_std", type=float, default=0.05)
+    parser.add_argument(
+        "--memory_update_dropout_probability",
+        type=float,
+        default=0.05,
+    )
+    parser.add_argument("--timestep_shift", type=float, default=5.0)
     parser.add_argument("--depth_loss_weight", type=float, default=0.1)
     parser.add_argument("--text_dropout_probability", type=float, default=0.2)
     parser.add_argument("--control_block_indices", default="0,3,6,9,12,15,18,21")
-    parser.add_argument("--capture_encode_batch_size", type=int, default=8)
+    parser.add_argument("--capture_encode_batch_size", type=int, default=2)
     parser.add_argument("--train_batch_size", type=int, default=1)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
     parser.add_argument("--dataloader_workers", type=int, default=2)
@@ -124,8 +133,12 @@ def parse_args() -> argparse.Namespace:
         parser.error("--height and --width must both be multiples of 16")
     if args.latent_frames_per_chunk < 2:
         parser.error("--latent_frames_per_chunk must be at least 2")
-    if args.rollout_chunks < 1:
-        parser.error("--rollout_chunks must be at least 1")
+    if args.capture_clips < 1:
+        parser.error("--capture_clips must be at least 1")
+    if not 0 <= args.teacher_memory_probability <= 1:
+        parser.error("--teacher_memory_probability must be in [0,1]")
+    if not 0 <= args.memory_update_dropout_probability <= 1:
+        parser.error("--memory_update_dropout_probability must be in [0,1]")
     if args.train_batch_size < 1:
         parser.error("--train_batch_size must be at least 1")
     if (
@@ -365,10 +378,12 @@ def main() -> None:
     sample_config = LongTrajectorySampleConfig(
         height=args.height,
         width=args.width,
-        capture_frames=args.capture_frames,
+        capture_clips=args.capture_clips,
+        capture_clip_rgb_frames=args.capture_clip_rgb_frames,
+        preceding_rgb_frames=args.preceding_rgb_frames,
+        reference_frames=args.reference_frames,
         history_min_frames=args.history_min_frames,
         history_max_frames=args.history_max_frames,
-        rollout_chunks=args.rollout_chunks,
         latent_frames_per_chunk=args.latent_frames_per_chunk,
         samples_per_item=args.samples_per_item,
         min_depth=args.min_depth,
@@ -414,10 +429,12 @@ def main() -> None:
         accelerator.load_state(args.resume_from_checkpoint)
 
     training_config = MemoryTrainingConfig(
-        rollout_chunks=args.rollout_chunks,
         latent_frames_per_chunk=args.latent_frames_per_chunk,
         depth_loss_weight=args.depth_loss_weight,
         teacher_memory_probability=args.teacher_memory_probability,
+        memory_update_noise_std=args.memory_update_noise_std,
+        memory_update_dropout_probability=args.memory_update_dropout_probability,
+        timestep_shift=args.timestep_shift,
         min_depth=args.min_depth,
         max_depth=args.max_depth,
         depth_edge_threshold=args.depth_edge_threshold,

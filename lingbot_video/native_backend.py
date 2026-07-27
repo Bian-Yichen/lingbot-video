@@ -67,7 +67,7 @@ def _patch_qwen3vl_from_pretrained():
         return
 
     original_from_pretrained = Qwen3VLForConditionalGeneration.from_pretrained
-    attn_implementation = os.environ.get("LINGBOT_QWEN_ATTN_IMPLEMENTATION", "flash_attention_3")
+    attn_implementation = os.environ.get("LINGBOT_QWEN_ATTN_IMPLEMENTATION", "sdpa")
 
     @classmethod
     def patched_from_pretrained(cls, pretrained_model_name_or_path, *args, **kwargs):

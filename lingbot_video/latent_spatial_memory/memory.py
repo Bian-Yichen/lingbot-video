@@ -266,6 +266,44 @@ class LatentSpatialMemory:
                 rtol=1e-5,
                 atol=1e-6,
             )
+            winner_cells = linear[winners]
+            winner_sources = source_indices[winners]
+            newest_frame = torch.full(
+                (cell_count,),
+                torch.iinfo(torch.long).min,
+                device=self.device,
+                dtype=torch.long,
+            )
+            newest_frame.scatter_reduce_(
+                0,
+                winner_cells,
+                self.frame_ids[winner_sources],
+                reduce="amax",
+                include_self=True,
+            )
+            newest = (
+                self.frame_ids[winner_sources]
+                == newest_frame[winner_cells]
+            )
+            newest_cells = winner_cells[newest]
+            newest_sources = winner_sources[newest]
+            best_confidence = torch.full(
+                (cell_count,),
+                -float("inf"),
+                device=self.device,
+                dtype=torch.float32,
+            )
+            best_confidence.scatter_reduce_(
+                0,
+                newest_cells,
+                self.confidence[newest_sources],
+                reduce="amax",
+                include_self=True,
+            )
+            best = torch.isclose(
+                self.confidence[newest_sources],
+                best_confidence[newest_cells],
+            )
             winner_index = torch.full(
                 (cell_count,),
                 len(self),
@@ -274,8 +312,8 @@ class LatentSpatialMemory:
             )
             winner_index.scatter_reduce_(
                 0,
-                linear[winners],
-                source_indices[winners],
+                newest_cells[best],
+                newest_sources[best],
                 reduce="amin",
                 include_self=True,
             )

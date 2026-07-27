@@ -31,10 +31,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--item_name", default=None)
     parser.add_argument("--height", type=int, default=480)
     parser.add_argument("--width", type=int, default=832)
-    parser.add_argument("--capture_frames", type=int, default=48)
+    parser.add_argument("--capture_clips", type=int, default=16)
+    parser.add_argument("--capture_clip_rgb_frames", type=int, default=9)
+    parser.add_argument("--preceding_rgb_frames", type=int, default=8)
+    parser.add_argument("--reference_frames", type=int, default=4)
     parser.add_argument("--history_min_frames", type=int, default=256)
     parser.add_argument("--history_max_frames", type=int, default=4096)
-    parser.add_argument("--rollout_chunks", type=int, default=2)
     parser.add_argument("--latent_frames_per_chunk", type=int, default=9)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--rclone_config", default=None)
@@ -61,10 +63,12 @@ def main() -> None:
     config = LongTrajectorySampleConfig(
         height=args.height,
         width=args.width,
-        capture_frames=args.capture_frames,
+        capture_clips=args.capture_clips,
+        capture_clip_rgb_frames=args.capture_clip_rgb_frames,
+        preceding_rgb_frames=args.preceding_rgb_frames,
+        reference_frames=args.reference_frames,
         history_min_frames=args.history_min_frames,
         history_max_frames=args.history_max_frames,
-        rollout_chunks=args.rollout_chunks,
         latent_frames_per_chunk=args.latent_frames_per_chunk,
     )
     sample = item.sample(config, random.Random(args.seed))

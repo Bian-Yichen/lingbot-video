@@ -36,8 +36,6 @@ from lingbot_video.latent_spatial_memory.memory import (  # noqa: E402
     memory_consistency_mask,
 )
 from lingbot_video.latent_spatial_memory.model import (  # noqa: E402
-    PRECEDING_SEGMENT,
-    TARGET_SEGMENT,
     LatentMetricDepthHead,
     LingBotVideoLatentMemoryModel,
 )
@@ -68,7 +66,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output", required=True)
     parser.add_argument("--target_start", type=int, required=True)
     parser.add_argument("--history_frames", type=int, default=4096)
-    parser.add_argument("--capture_frames", type=int, default=64)
+    parser.add_argument("--capture_clips", type=int, default=20)
+    parser.add_argument("--capture_clip_rgb_frames", type=int, default=9)
     parser.add_argument("--num_frames", type=int, default=257)
     parser.add_argument("--height", type=int, default=480)
     parser.add_argument("--width", type=int, default=832)
@@ -89,39 +88,52 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _select_capture(
+def _select_capture_clips(
     item: VipeRoomTourItem,
     target_start: int,
     history_frames: int,
     count: int,
-) -> list[int]:
-    available = sorted(
-        set(item.rgb_by_index)
-        & set(item.depth_location)
+    clip_frames: int,
+) -> tuple[list[int], list[int]]:
+    if clip_frames < 1 or (clip_frames - 1) % 4:
+        raise ValueError("capture_clip_rgb_frames must equal 1 + 4k")
+    rgb = set(item.rgb_by_index)
+    geometry = (
+        set(item.depth_location)
         & set(item.pose_by_index)
         & set(item.intrinsics_by_index)
     )
-    candidates = [
-        index
-        for index in available
-        if target_start - history_frames <= index <= target_start
-    ]
-    if target_start not in candidates:
-        raise ValueError("target_start must have RGB, depth, pose, and intrinsics")
+    anchor_offsets = tuple(range(0, clip_frames, 4))
+    first_start = max(min(rgb), target_start - history_frames)
+    final_start = target_start - clip_frames + 1
+    candidates = []
+    for start in range(first_start, final_start + 1):
+        if not all(start + offset in rgb for offset in range(clip_frames)):
+            continue
+        if not all(start + offset in geometry for offset in anchor_offsets):
+            continue
+        candidates.append(start)
+    if final_start not in candidates:
+        raise ValueError("the causal capture clip ending at target_start is incomplete")
     if len(candidates) < count:
-        raise ValueError(f"only {len(candidates)} valid capture frames, requested {count}")
+        raise ValueError(f"only {len(candidates)} valid capture clips, requested {count}")
     positions = np.linspace(0, len(candidates) - 1, count).round().astype(np.int64)
     selected = sorted(set(candidates[int(position)] for position in positions))
-    for index in candidates:
+    for start in candidates:
         if len(selected) == count:
             break
-        if index not in selected:
-            selected.append(index)
+        if start not in selected:
+            selected.append(start)
     selected = sorted(selected)[:count]
-    if selected[-1] != target_start:
-        selected[-1] = target_start
+    if selected[-1] != final_start:
+        selected[-1] = final_start
         selected = sorted(selected)
-    return selected
+    anchor_indices = [
+        start + offset
+        for start in selected
+        for offset in anchor_offsets
+    ]
+    return selected, anchor_indices
 
 
 def _load_model(args: argparse.Namespace, device: torch.device):
@@ -219,11 +231,12 @@ def main() -> None:
         ),
     )
     item = VipeRoomTourItem(cache.materialize(args.item_name))
-    capture_indices = _select_capture(
+    capture_clip_starts, capture_indices = _select_capture_clips(
         item,
         args.target_start,
         args.history_frames,
-        args.capture_frames,
+        args.capture_clips,
+        args.capture_clip_rgb_frames,
     )
     target_indices = [
         args.target_start + 4 * index for index in range(target_latent_count)
@@ -239,7 +252,16 @@ def main() -> None:
     target_hw = (args.height, args.width)
     source_hw = item.source_hw
     capture_rgb = torch.stack(
-        [item.read_rgb(index, target_hw) for index in capture_indices]
+        [
+            torch.stack(
+                [
+                    item.read_rgb(start + offset, target_hw)
+                    for offset in range(args.capture_clip_rgb_frames)
+                ],
+                dim=1,
+            )
+            for start in capture_clip_starts
+        ]
     ).unsqueeze(0).to(device)
     capture_depth = torch.stack(
         [item.read_depth(index, target_hw) for index in capture_indices]
@@ -277,7 +299,7 @@ def main() -> None:
         capture_latents = encode_capture_latents(
             pipe.vae,
             capture_rgb,
-            micro_batch_size=8,
+            micro_batch_size=2,
             generator=generator,
         )[0]
     latent_hw = (capture_latents.shape[-2], capture_latents.shape[-1])
@@ -329,17 +351,27 @@ def main() -> None:
         )
     memory.compact()
     reference_latent = capture_latents[:1].permute(1, 0, 2, 3).unsqueeze(0)
-    reference_rays = make_plucker_rays(
-        capture_c2w[:1].unsqueeze(0),
-        capture_k_latent[:1].unsqueeze(0),
-        *latent_hw,
-    ).transpose(1, 2)
     prompt_embeds, prompt_mask = pipe.encode_prompt(args.prompt, device=device)
     transformer_dtype = next(model.backbone.parameters()).dtype
 
+    capture_latents_per_clip = 1 + (args.capture_clip_rgb_frames - 1) // 4
+    if capture_latents_per_clip < 3:
+        raise ValueError("the initial chunk requires a capture clip with >=3 latents")
+    final_clip_latents = capture_latents[-capture_latents_per_clip:]
+    initial_preceding = final_clip_latents[-3:-1].permute(
+        1,
+        0,
+        2,
+        3,
+    ).unsqueeze(0)
+    initial_prefix = final_clip_latents[-1].unsqueeze(0)
+    initial_preceding_c2w = capture_c2w[-3:-1]
+    initial_preceding_k_latent = capture_k_latent[-3:-1]
+
     all_latents = []
     all_depths = []
-    prefix = capture_latents[-1].unsqueeze(0)
+    generated_latents: list[torch.Tensor] = []
+    prefix = initial_prefix
     chunk_stride = args.chunk_latent_frames - 1
     chunk_count = (target_latent_count - 1) // chunk_stride
     for chunk_index in range(chunk_count):
@@ -347,13 +379,32 @@ def main() -> None:
         end = start + args.chunk_latent_frames
         chunk_c2w = target_c2w[start:end]
         chunk_k = target_k_latent[start:end]
-        readout = memory.read(chunk_c2w, chunk_k, latent_hw)
+        if chunk_index == 0:
+            preceding_latents = initial_preceding
+            preceding_c2w = initial_preceding_c2w
+            preceding_k = initial_preceding_k_latent
+        else:
+            preceding_start = max(0, start - 2)
+            preceding_latents = torch.stack(
+                generated_latents[preceding_start:start],
+                dim=1,
+            ).unsqueeze(0)
+            preceding_c2w = target_c2w[preceding_start:start]
+            preceding_k = target_k_latent[preceding_start:start]
+        condition_c2w = torch.cat((chunk_c2w, preceding_c2w), dim=0)
+        condition_k = torch.cat((chunk_k, preceding_k), dim=0)
+        readout = memory.read(condition_c2w, condition_k, latent_hw)
         memory_latents = readout.features.unsqueeze(0)
         visibility = readout.visibility.unsqueeze(0)
         projected_depth = readout.depth.unsqueeze(0)
         rays = make_plucker_rays(
             chunk_c2w.unsqueeze(0),
             chunk_k.unsqueeze(0),
+            *latent_hw,
+        ).transpose(1, 2)
+        preceding_rays = make_plucker_rays(
+            preceding_c2w.unsqueeze(0),
+            preceding_k.unsqueeze(0),
             *latent_hw,
         ).transpose(1, 2)
         latents = torch.randn(
@@ -366,31 +417,29 @@ def main() -> None:
             dtype=torch.float32,
         )
         latents[:, :, 0] = prefix
-        segment_ids = torch.full(
-            (1, args.chunk_latent_frames),
-            TARGET_SEGMENT,
-            device=device,
-            dtype=torch.long,
-        )
-        segment_ids[:, 0] = PRECEDING_SEGMENT
         pipe.scheduler.set_timesteps(args.steps, device=device, shift=args.shift)
         for timestep in pipe.scheduler.timesteps:
             timestep_batch = _transformer_timestep(
                 timestep,
                 transformer_dtype,
             ).expand(1).to(device)
+            target_timesteps = timestep_batch[:, None].expand(
+                1,
+                args.chunk_latent_frames,
+            ).clone()
+            target_timesteps[:, 0] = 0
             with torch.no_grad(), _transformer_autocast(device, transformer_dtype):
                 velocity = model(
                     noisy_latents=latents,
-                    timestep=timestep_batch,
+                    target_timesteps=target_timesteps,
                     encoder_hidden_states=prompt_embeds.to(transformer_dtype),
                     encoder_attention_mask=prompt_mask,
                     memory_latents=memory_latents,
                     memory_visibility=visibility,
                     target_rays=rays,
-                    target_segment_ids=segment_ids,
+                    preceding_latents=preceding_latents,
+                    preceding_rays=preceding_rays,
                     reference_latents=reference_latent,
-                    reference_rays=reference_rays,
                 ).velocity.float()
             latents = pipe.scheduler.step(
                 velocity,
@@ -404,8 +453,8 @@ def main() -> None:
             predicted_depth = model.predict_log_depth(
                 latents,
                 rays,
-                projected_depth,
-                visibility,
+                projected_depth[:, :, : args.chunk_latent_frames],
+                visibility[:, :, : args.chunk_latent_frames],
             ).exp().squeeze(1)
         valid = (
             torch.isfinite(predicted_depth[0, 1:])
@@ -415,8 +464,8 @@ def main() -> None:
         valid = memory_consistency_mask(
             predicted_depth[0, 1:],
             valid,
-            projected_depth[0, 0, 1:],
-            visibility[0, 0, 1:],
+            projected_depth[0, 0, 1 : args.chunk_latent_frames],
+            visibility[0, 0, 1 : args.chunk_latent_frames],
             relative_threshold=args.memory_consistency_threshold,
         )
         memory.write_video(
@@ -436,6 +485,10 @@ def main() -> None:
             predicted_depth.cpu()
             if chunk_index == 0
             else predicted_depth[:, 1:].cpu()
+        )
+        new_generated = latents[0] if chunk_index == 0 else latents[0, :, 1:]
+        generated_latents.extend(
+            list(torch.unbind(new_generated.detach(), dim=1))
         )
         prefix = latents[:, :, -1].detach()
         print(

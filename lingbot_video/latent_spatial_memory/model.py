@@ -81,68 +81,149 @@ class LingBotVideoLatentMemoryModel(nn.Module):
         self,
         *,
         noisy_latents: torch.Tensor,
-        timestep: torch.Tensor,
+        target_timesteps: torch.Tensor,
         encoder_hidden_states: torch.Tensor,
         encoder_attention_mask: Optional[torch.Tensor],
         memory_latents: torch.Tensor,
         memory_visibility: torch.Tensor,
         target_rays: torch.Tensor,
-        target_segment_ids: torch.Tensor,
+        preceding_latents: torch.Tensor,
+        preceding_rays: torch.Tensor,
         reference_latents: torch.Tensor,
-        reference_rays: torch.Tensor,
     ) -> LatentMemoryModelOutput:
         batch, _channels, target_frames, height, width = noisy_latents.shape
+        preceding_frames = preceding_latents.shape[2]
         reference_frames = reference_latents.shape[2]
-        condition_latents = torch.cat((memory_latents, reference_latents), dim=2)
-        condition_visibility = torch.cat(
+        conditioned_frames = target_frames + preceding_frames
+        if memory_latents.shape != (
+            batch,
+            noisy_latents.shape[1],
+            conditioned_frames,
+            height,
+            width,
+        ):
+            raise ValueError(
+                "memory_latents must align with [target, preceding] frames"
+            )
+        if memory_visibility.shape != (
+            batch,
+            1,
+            conditioned_frames,
+            height,
+            width,
+        ):
+            raise ValueError("memory_visibility must align with memory_latents")
+        if target_timesteps.shape != (batch, target_frames):
+            raise ValueError("target_timesteps must be [B,T_target]")
+
+        control_latents = torch.cat((noisy_latents, preceding_latents), dim=2)
+        control_rays = torch.cat((target_rays, preceding_rays), dim=2)
+        control_segments = torch.cat(
             (
-                memory_visibility,
-                torch.ones(
-                    batch,
-                    1,
-                    reference_frames,
-                    height,
-                    width,
-                    device=memory_visibility.device,
-                    dtype=memory_visibility.dtype,
+                torch.full(
+                    (batch, target_frames),
+                    TARGET_SEGMENT,
+                    device=noisy_latents.device,
+                    dtype=torch.long,
+                ),
+                torch.full(
+                    (batch, preceding_frames),
+                    PRECEDING_SEGMENT,
+                    device=noisy_latents.device,
+                    dtype=torch.long,
                 ),
             ),
-            dim=2,
+            dim=1,
         )
-        condition_rays = torch.cat((target_rays, reference_rays), dim=2)
-        condition_segments = torch.cat(
+        control_timesteps = torch.cat(
             (
-                target_segment_ids,
-                torch.full(
-                    (batch, reference_frames),
-                    REFERENCE_SEGMENT,
-                    device=target_segment_ids.device,
-                    dtype=target_segment_ids.dtype,
+                target_timesteps,
+                torch.zeros(
+                    batch,
+                    preceding_frames,
+                    device=target_timesteps.device,
+                    dtype=target_timesteps.dtype,
                 ),
             ),
             dim=1,
         )
         residuals = self.controlnet(
             backbone=self.backbone,
-            noisy_latents=noisy_latents,
-            condition_latents=condition_latents,
-            visibility=condition_visibility,
-            rays=condition_rays,
-            segment_ids=condition_segments,
-            target_frames=target_frames,
-            timestep=timestep,
+            backbone_latents=control_latents,
+            memory_latents=memory_latents,
+            visibility=memory_visibility,
+            rays=control_rays,
+            segment_ids=control_segments,
+            frame_timesteps=control_timesteps,
             encoder_hidden_states=encoder_hidden_states,
             encoder_attention_mask=encoder_attention_mask,
         )
-        velocity = self.backbone(
-            noisy_latents,
-            timestep,
+
+        # MIRAGE performs one forward over [reference, noisy target, preceding].
+        # Clean context uses timestep zero and only the target slice is trained.
+        backbone_latents = torch.cat(
+            (reference_latents, noisy_latents, preceding_latents),
+            dim=2,
+        )
+        backbone_timesteps = torch.cat(
+            (
+                torch.zeros(
+                    batch,
+                    reference_frames,
+                    device=target_timesteps.device,
+                    dtype=target_timesteps.dtype,
+                ),
+                target_timesteps,
+                torch.zeros(
+                    batch,
+                    preceding_frames,
+                    device=target_timesteps.device,
+                    dtype=target_timesteps.dtype,
+                ),
+            ),
+            dim=1,
+        )
+        backbone_segments = torch.cat(
+            (
+                torch.full(
+                    (batch, reference_frames),
+                    REFERENCE_SEGMENT,
+                    device=noisy_latents.device,
+                    dtype=torch.long,
+                ),
+                torch.full(
+                    (batch, target_frames),
+                    TARGET_SEGMENT,
+                    device=noisy_latents.device,
+                    dtype=torch.long,
+                ),
+                torch.full(
+                    (batch, preceding_frames),
+                    PRECEDING_SEGMENT,
+                    device=noisy_latents.device,
+                    dtype=torch.long,
+                ),
+            ),
+            dim=1,
+        )
+        velocity_all = self.backbone(
+            backbone_latents,
+            backbone_timesteps,
             encoder_hidden_states,
             encoder_attention_mask=encoder_attention_mask,
-            video_segment_ids=target_segment_ids,
+            video_segment_ids=backbone_segments,
             block_control_residuals=residuals,
+            block_control_frame_range=(
+                reference_frames,
+                reference_frames + conditioned_frames,
+            ),
             return_dict=False,
         )[0]
+        velocity = velocity_all[
+            :,
+            :,
+            reference_frames : reference_frames + target_frames,
+        ]
         return LatentMemoryModelOutput(velocity=velocity, control_residuals=residuals)
 
     def predict_log_depth(

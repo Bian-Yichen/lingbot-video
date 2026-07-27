@@ -23,17 +23,22 @@ for Video World Models*（Mirage）适配到 LingBot-Video，并直接读取
    “数值恰好为零的已观察 feature”。
 4. 使用由主干对应 block 初始化的 ControlNet-style side branch，并通过
    zero-initialized output projection 在八个深度位置注入 LingBot DiT。
-   侧支路将当前 noisy target 与同视角 memory token 分别经过共享 patch
-   embedding 后相加，因此每个 denoising step 都依赖当前状态，同时没有额外
-   bridging encoder。
-5. 将 noisy target、clean preceding overlap、clean reference 分配到不同的
-   temporal RoPE 区段，实现 segment-aware rotary encoding。
+   侧支路严格采用 VACE 拓扑：第一层输入为
+   `before_proj(memory_token) + backbone_token`，随后八个 side block 递归运行，
+   每层的 `after_proj` 在初始化时为零，并在对应主干层之后注入。
+5. 主干在一次 forward 中接收
+   `[clean reference, noisy target, clean preceding]`；reference/preceding 的
+   timestep 为零，只有 target 接受 flow noise 和 loss。三类帧使用不同的
+   temporal RoPE 区段。3D readout 只进入 side branch，不替代 clean context。
 6. 第一阶段冻结主干和 VAE，只训练 side branch；第二阶段加入 self-attention
    `q/k/v/o` rank-64 LoRA，与 side branch 联合训练。
 7. 按 chunk 自回归生成；每个 chunk 完成后将新 latent 写回 3D memory，下一
    chunk 立即读取更新后的 memory。
 8. depth 采用论文附录验证最优的 bilinear downsampling；缓存写入前剔除无效
    深度和深度不连续边界。
+9. Transformer 的普通、packed batch 和 context-parallel attention 全部调用
+   PyTorch `scaled_dot_product_attention`；Qwen3-VL 也默认 `attn_implementation=sdpa`，
+   不需要安装 FlashAttention 3。
 
 ## 2. 针对 LingBot 与本数据的必要适配
 
@@ -73,40 +78,48 @@ LingBot 原始发布模型没有 camera-control branch，因此将目标相机�
 1. rclone 一次性下载该 item 中训练需要的最小子集：`RGB/`、depth ZIP/shards、
    pose NPZ、intrinsics NPZ 和 metadata。
 2. 在节点本地 cache 中保留该 item，默认连续产生 32 个 iteration。
-3. 每次从目标帧之前最长 4096 帧的历史中分层抽取 48/64 个 capture keyframes。
-   分层抽样覆盖整条历史，不只保留最近帧。
-4. 目标取连续 65 张 RGB。LingBot VAE temporal stride 为 4，因此得到 17 个
-   latent frames，拆成两个 `9-latent` chunk，相邻 chunk 重叠一个 clean latent。
-5. capture 的最后一帧与目标第一帧相同，作为第一个 chunk 的 clean preceding
-   overlap；capture 第一帧作为 clean reference。
-6. 第一个 chunk 预测后立刻更新 memory；第二个 chunk 使用已经更新的 memory。
+3. 每次从目标帧之前最长 4096 帧的历史中分层抽取 16/20 个连续 capture clip；
+   每个 clip 为 9 RGB，经过 causal VAE 后得到 3 个 temporal latent anchor，
+   分别绑定到该 clip 的第 `0/4/8` 帧 depth 和 pose。Memory 因而覆盖整条长历史，
+   但不会把 5000 帧作为 Transformer token。
+4. 每次只监督论文规定的连续 33 RGB，即 9 个 target latent。连续 65 RGB
+   只是两个局部窗口，并不能自动构成长程目标，还会让一次 iteration 的 I/O、
+   VAE 显存和反向成本接近翻倍。
+5. target 前 8 RGB 单独编码为 2 个 clean preceding latent；另外从历史中均匀
+   取最多 4 个 clean reference，不做 AnyRecon 式 capture retrieval。
+6. 最后一个 capture clip 恰好结束在 target 首帧；它的最后一个 causal latent
+   作为 target 的 clean overlap，严格模拟上一生成 chunk 的末 latent。
 
 因此，“长程”来自跨最多数千原始帧构建的 persistent 3D latent cache，而目标视频
-仍保持连续帧，符合预训练视频模型的局部运动分布。随着同一 item 被多次采样，
+窗口仍保持 33 个连续 RGB，符合预训练视频模型的局部运动分布。随着同一 item 被多次采样，
 不同 iteration 会覆盖不同历史范围与目标位置。
 
 ## 4. 输入与监督
 
 每个 batch 的输入为：
 
-- `capture_rgb`: `[B,N,3,H,W]`
-- `capture_depth`: `[B,N,H,W]`
-- `capture_c2w`: `[B,N,4,4]`
-- `capture_intrinsics`: `[B,N,3,3]`
-- `target_rgb`: `[B,3,65,H,W]`
-- target latent 时刻对应的 depth/c2w/intrinsics，共 17 帧
+- `capture_rgb`: `[B,Nclip,3,9,H,W]`
+- capture 经过 VAE 后为 `[B,Nclip*3,C,h,w]`，对应同数量的
+  depth/c2w/intrinsics
+- `preceding_rgb`: `[B,3,8,H,W]`，编码为 `[B,C,2,h,w]`
+- `reference_rgb`: `[B,R,3,H,W]`，逐帧编码为 `[B,C,R,h,w]`
+- `target_rgb`: `[B,3,33,H,W]`，编码为 `[B,C,9,h,w]`
+- target latent 时刻对应的 depth/c2w/intrinsics，共 9 帧
 
 监督包括：
 
-1. 两个 chunk 的 target-frame flow-matching loss；每个 chunk 第一 latent 是
-   clean overlap，不计入 flow loss。
+1. 一个 9-latent chunk 的 target-frame flow-matching loss；第一 latent 是
+   clean overlap，不加噪且不计入 flow loss。每个 target latent 独立采样
+   shifted flow timestep。
 2. 生成 clean latent 上的 metric log-depth loss：scale-invariant 项加 metric
    Smooth-L1 项。
 3. `readout_error` 仅作为数据/几何监控指标，比较可见 cell 的 memory readout
    与目标 clean latent，不参与优化。
 
-Stage 1 使用 ground-truth latent/depth 更新下一 chunk 的 memory；Stage 2 默认
-以 0.5 概率使用模型预测更新，训练生成误差进入后续 memory 后的鲁棒性。
+长历史 capture clip 按时间顺序写入，因此同一个训练样本已经包含多次动态 memory
+update。Stage 1 使用干净 teacher memory；Stage 2 对后续写入以 0.2 概率加入
+latent noise，并随机丢弃 5% memory cells，近似递归生成误差。真实推理仍在每个
+chunk 完成后把生成 latent 和预测 depth 写回，再由下一 chunk 查询。
 
 ## 5. Pose 与分辨率
 
@@ -192,8 +205,8 @@ camera poses 与 intrinsics。
 
 ## 8. 关键配置建议
 
-- 先用 `480×832, capture_frames=48, rollout_chunks=2` 验证训练正确性。
-- Stage 2 再将 capture 增至 64；不建议一开始将 5000 帧全部编码。
+- 先用 `480×832, capture_clips=16, capture_clip_rgb_frames=9` 验证训练正确性。
+- Stage 2 再将 `capture_clips` 增至 20；不建议一开始将 5000 帧全部编码。
 - `memory_voxel_size=0` 最忠实于论文；长推理可设置约 `0.02 m`，每个 voxel
   保留最新且最高置信 observation，不平均 latent feature。
 - 如果单个 item 很大，继续提高 `samples_per_item`，以摊薄下载成本。
