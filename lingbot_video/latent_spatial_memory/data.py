@@ -30,6 +30,11 @@ from .geometry import (
 
 logger = logging.getLogger(__name__)
 
+# VIPE estimates depth/pose/intrinsics once every five source RGB frames.  The
+# rest of the training stack operates on the contiguous VIPE timeline, so
+# VIPE index i must read source RGB frame 5 * i.
+RGB_SOURCE_FRAME_STRIDE = 5
+
 
 def _is_rclone_remote(path: str) -> bool:
     if os.path.exists(path):
@@ -76,7 +81,14 @@ class RoomTourItemCache:
     """Node-local cache that downloads one useful item subset and reuses it."""
 
     INCLUDE_PATTERNS = (
-        "/RGB/**",
+        "/RGB/*[05].jpg",
+        "/RGB/*[05].jpeg",
+        "/RGB/*[05].png",
+        "/RGB/*[05].webp",
+        "/RGB/*[05].JPG",
+        "/RGB/*[05].JPEG",
+        "/RGB/*[05].PNG",
+        "/RGB/*[05].WEBP",
         "/chunk_metadata.json",
         "/vipe/vipe_artifacts/pose/video.npz",
         "/vipe/vipe_artifacts/intrinsics/video.npz",
@@ -295,7 +307,10 @@ class VipeRoomTourItem:
             artifact_root / "intrinsics" / "video.npz"
         )
         self._validate_camera_type(artifact_root / "intrinsics" / "video_camera.txt")
-        self.rgb_by_index = self._index_rgb()
+        (
+            self.rgb_by_index,
+            self.rgb_source_index_by_index,
+        ) = self._index_rgb()
         self.depth_location = self._index_depth(artifact_root / "depth")
         self._depth_cache: dict[int, np.ndarray] = {}
         self._depth_cache_order: list[int] = []
@@ -321,18 +336,29 @@ class VipeRoomTourItem:
                 f"only PINHOLE VIPE artifacts are supported, found {sorted(unsupported)}"
             )
 
-    def _index_rgb(self) -> dict[int, Path]:
+    def _index_rgb(self) -> tuple[dict[int, Path], dict[int, int]]:
+        """Map contiguous VIPE indices to every fifth source RGB frame."""
+
         output: dict[int, Path] = {}
+        source_indices: dict[int, int] = {}
         for path in sorted((self.root / "RGB").glob("*")):
             if not path.is_file() or path.suffix.lower() not in {".jpg", ".jpeg", ".png", ".webp"}:
                 continue
             try:
-                output[int(path.stem)] = path
+                source_index = int(path.stem)
             except ValueError:
                 continue
+            if source_index % RGB_SOURCE_FRAME_STRIDE:
+                continue
+            vipe_index = source_index // RGB_SOURCE_FRAME_STRIDE
+            output[vipe_index] = path
+            source_indices[vipe_index] = source_index
         if not output:
-            raise FileNotFoundError(f"no indexed RGB frames below {self.root / 'RGB'}")
-        return output
+            raise FileNotFoundError(
+                f"no RGB frames divisible by {RGB_SOURCE_FRAME_STRIDE} below "
+                f"{self.root / 'RGB'}"
+            )
+        return output, source_indices
 
     @staticmethod
     def _index_depth(depth_root: Path) -> dict[int, tuple[Path, str]]:
