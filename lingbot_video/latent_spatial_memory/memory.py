@@ -225,16 +225,29 @@ class LatentSpatialMemory:
             return LatentMemoryReadout(output_features, output_visibility, output_depth)
 
         homogeneous = torch.cat(
-            (self.points, torch.ones(len(self), 1, device=self.device)),
+            (
+                self.points,
+                torch.ones(
+                    len(self),
+                    1,
+                    device=self.device,
+                    dtype=torch.float32,
+                ),
+            ),
             dim=1,
         )
         point_indices = torch.arange(len(self), device=self.device, dtype=torch.long)
         for view_index in range(num_views):
-            w2c = torch.linalg.inv(c2w[view_index].float())
-            camera = homogeneous @ w2c.T
-            xyz = camera[:, :3]
-            z = xyz[:, 2]
-            projected = xyz @ intrinsics[view_index].float().T
+            # The training step runs under bf16 autocast, but camera inversion,
+            # projection and z-buffer depth must remain fp32.  Otherwise CUDA
+            # autocast turns the matmul outputs into bf16 while the reduction
+            # buffers are fp32, and scatter_reduce_ rejects the mixed dtypes.
+            with torch.amp.autocast(self.device.type, enabled=False):
+                w2c = torch.linalg.inv(c2w[view_index].float())
+                camera = homogeneous.float() @ w2c.T
+                xyz = camera[:, :3]
+                z = xyz[:, 2]
+                projected = xyz @ intrinsics[view_index].float().T
             u = torch.floor(projected[:, 0] / z.clamp_min(1e-8)).long()
             v = torch.floor(projected[:, 1] / z.clamp_min(1e-8)).long()
             valid = (
@@ -249,7 +262,7 @@ class LatentSpatialMemory:
                 continue
             u_valid = u[valid]
             v_valid = v[valid]
-            z_valid = z[valid]
+            z_valid = z[valid].float()
             source_indices = point_indices[valid]
             linear = v_valid * output_w + u_valid
             cell_count = output_h * output_w
