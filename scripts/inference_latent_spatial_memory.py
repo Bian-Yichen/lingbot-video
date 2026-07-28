@@ -3,8 +3,13 @@ from __future__ import annotations
 import argparse
 import contextlib
 import gc
+import json
+import logging
+import math
+import random
 import sys
 from pathlib import Path
+from typing import Any, Sequence
 
 import imageio.v3 as iio
 import numpy as np
@@ -18,146 +23,315 @@ from lingbot_video.latent_spatial_memory.controlnet import (  # noqa: E402
     LingBotLatentMemoryControlNet,
 )
 from lingbot_video.latent_spatial_memory.data import (  # noqa: E402
+    LongTrajectorySampleConfig,
     RcloneConfig,
     RoomTourItemCache,
+    SOURCE_FRAME_STRIDE,
     VipeRoomTourItem,
 )
 from lingbot_video.latent_spatial_memory.geometry import (  # noqa: E402
-    depth_validity_mask,
-    downsample_depth_bilinear,
-    intrinsics_vector_to_matrix,
     make_plucker_rays,
-    normalize_c2w_to_first_capture,
-    resize_crop_intrinsics,
     scale_intrinsics,
 )
-from lingbot_video.latent_spatial_memory.memory import (  # noqa: E402
-    LatentSpatialMemory,
-    memory_consistency_mask,
+from lingbot_video.latent_spatial_memory.inference import (  # noqa: E402
+    denoise_latent_memory_chunk,
+    predict_metric_depth,
 )
 from lingbot_video.latent_spatial_memory.model import (  # noqa: E402
     LatentMetricDepthHead,
     LingBotVideoLatentMemoryModel,
 )
 from lingbot_video.latent_spatial_memory.training import (  # noqa: E402
+    MemoryTrainingConfig,
+    _downsample_depth_and_valid,
+    build_capture_memories,
     encode_capture_latents,
+    encode_reference_latents,
+    encode_video_latents,
 )
-from lingbot_video.pipeline_lingbot_video import (  # noqa: E402
-    LingBotVideoPipeline,
-    _transformer_autocast,
-    _transformer_timestep,
-)
+from lingbot_video.pipeline_lingbot_video import LingBotVideoPipeline  # noqa: E402
 from lingbot_video.runner import _patch_qwen3vl_from_pretrained  # noqa: E402
 from lingbot_video.transformer_lingbot_video import (  # noqa: E402
     LingBotVideoTransformer3DModel,
 )
 
 
+logger = logging.getLogger("lingbot_video.inference_latent_spatial_memory")
+
+
+INHERITED_ARGUMENTS = {
+    "model_dir",
+    "dataset_root",
+    "cache_root",
+    "prompt",
+    "height",
+    "width",
+    "capture_clips",
+    "capture_clip_rgb_frames",
+    "preceding_rgb_frames",
+    "reference_frames",
+    "history_min_frames",
+    "history_max_frames",
+    "latent_frames_per_chunk",
+    "min_depth",
+    "max_depth",
+    "depth_edge_threshold",
+    "memory_consistency_threshold",
+    "memory_max_points",
+    "memory_voxel_size",
+    "timestep_shift",
+    "control_block_indices",
+    "capture_encode_batch_size",
+    "mixed_precision",
+    "lora_rank",
+    "lora_alpha",
+    "rclone_binary",
+    "rclone_config",
+    "rclone_clear_proxy",
+    "rclone_transfers",
+    "rclone_checkers",
+}
+
+
+def _resolve_checkpoint(path: str | Path) -> Path:
+    checkpoint = Path(path).expanduser()
+    if checkpoint.is_dir():
+        checkpoint = checkpoint / "trainable_components.pt"
+    if not checkpoint.is_file():
+        raise FileNotFoundError(
+            f"checkpoint not found: {checkpoint}; pass either "
+            "trainable_components.pt or its containing checkpoint directory"
+        )
+    return checkpoint.resolve()
+
+
+def _read_json_object(path: Path) -> dict[str, Any]:
+    with path.open(encoding="utf-8") as handle:
+        payload = json.load(handle)
+    if not isinstance(payload, dict):
+        raise ValueError(f"{path} must contain one JSON object")
+    return payload
+
+
+def _inherited_defaults() -> tuple[dict[str, Any], Path | None]:
+    bootstrap = argparse.ArgumentParser(add_help=False)
+    bootstrap.add_argument("--checkpoint", default=None)
+    bootstrap.add_argument("--config", default=None)
+    known, _ = bootstrap.parse_known_args()
+    if not known.checkpoint:
+        return {}, None
+    checkpoint = _resolve_checkpoint(known.checkpoint)
+    inherited: dict[str, Any] = {}
+    training_args = checkpoint.parent / "training_args.json"
+    if training_args.is_file():
+        inherited.update(_read_json_object(training_args))
+    if known.config:
+        inherited.update(_read_json_object(Path(known.config)))
+    return {
+        key: value
+        for key, value in inherited.items()
+        if key in INHERITED_ARGUMENTS
+    }, checkpoint
+
+
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--model_dir", required=True)
+    inherited, checkpoint = _inherited_defaults()
+    parser = argparse.ArgumentParser(
+        description=(
+            "Evaluate one training-shaped latent-spatial-memory sample with "
+            "full multi-step denoising."
+        )
+    )
+    parser.add_argument("--config", default=None)
     parser.add_argument("--checkpoint", required=True)
+    parser.add_argument("--model_dir", default=None)
     parser.add_argument(
         "--dataset_root",
         default="h:bianyichen/AnyReconProDataset_labeled/",
     )
     parser.add_argument("--item_name", required=True)
     parser.add_argument("--cache_root", default="/tmp/lingbot_latent_memory_cache")
-    parser.add_argument("--output", required=True)
-    parser.add_argument("--target_start", type=int, required=True)
-    parser.add_argument("--history_frames", type=int, default=4096)
-    parser.add_argument("--capture_clips", type=int, default=20)
-    parser.add_argument("--capture_clip_rgb_frames", type=int, default=9)
-    parser.add_argument("--num_frames", type=int, default=257)
+    parser.add_argument("--output_dir", required=True)
+    parser.add_argument("--prompt", default="An indoor room tour.")
     parser.add_argument("--height", type=int, default=480)
     parser.add_argument("--width", type=int, default=832)
-    parser.add_argument("--chunk_latent_frames", type=int, default=9)
-    parser.add_argument("--steps", type=int, default=40)
-    parser.add_argument("--shift", type=float, default=3.0)
-    parser.add_argument("--prompt", default="An indoor room tour.")
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--fps", type=int, default=24)
-    parser.add_argument("--memory_max_points", type=int, default=2_000_000)
-    parser.add_argument("--memory_voxel_size", type=float, default=0.02)
+    parser.add_argument("--capture_clips", type=int, default=16)
+    parser.add_argument("--capture_clip_rgb_frames", type=int, default=9)
+    parser.add_argument("--preceding_rgb_frames", type=int, default=8)
+    parser.add_argument("--reference_frames", type=int, default=4)
+    parser.add_argument("--history_min_frames", type=int, default=256)
+    parser.add_argument("--history_max_frames", type=int, default=4096)
+    parser.add_argument("--latent_frames_per_chunk", type=int, default=9)
     parser.add_argument("--min_depth", type=float, default=0.1)
     parser.add_argument("--max_depth", type=float, default=20.0)
     parser.add_argument("--depth_edge_threshold", type=float, default=0.08)
     parser.add_argument("--memory_consistency_threshold", type=float, default=0.15)
+    parser.add_argument("--memory_max_points", type=int, default=750_000)
+    parser.add_argument("--memory_voxel_size", type=float, default=0.0)
+    parser.add_argument("--timestep_shift", type=float, default=5.0)
+    parser.add_argument("--control_block_indices", default="0,3,6,9,12,15,18,21")
+    parser.add_argument("--capture_encode_batch_size", type=int, default=2)
+    parser.add_argument(
+        "--mixed_precision",
+        choices=["no", "fp16", "bf16"],
+        default="bf16",
+    )
+    parser.add_argument("--lora_rank", type=int, default=64)
+    parser.add_argument("--lora_alpha", type=int, default=64)
+    parser.add_argument("--steps", type=int, default=40)
+    parser.add_argument("--sample_seed", type=int, default=42)
+    parser.add_argument("--generation_seed", type=int, default=42)
+    parser.add_argument(
+        "--target_start",
+        type=int,
+        default=None,
+        help=(
+            "Optional internal target index. Internal index i corresponds to "
+            f"source RGB index {SOURCE_FRAME_STRIDE}*i. If omitted, sample it "
+            "exactly like training."
+        ),
+    )
+    parser.add_argument(
+        "--fps",
+        type=float,
+        default=None,
+        help="Output FPS. Defaults to source FPS / 5 when metadata provides it, else 6.",
+    )
+    parser.add_argument("--rclone_binary", default="rclone")
     parser.add_argument("--rclone_config", default=None)
-    parser.add_argument("--rclone_clear_proxy", action=argparse.BooleanOptionalAction, default=True)
-    return parser.parse_args()
-
-
-def _select_capture_clips(
-    item: VipeRoomTourItem,
-    target_start: int,
-    history_frames: int,
-    count: int,
-    clip_frames: int,
-) -> tuple[list[int], list[int]]:
-    if clip_frames < 1 or (clip_frames - 1) % 4:
-        raise ValueError("capture_clip_rgb_frames must equal 1 + 4k")
-    rgb = set(item.rgb_by_index)
-    geometry = (
-        set(item.depth_location)
-        & set(item.pose_by_index)
-        & set(item.intrinsics_by_index)
+    parser.add_argument(
+        "--rclone_clear_proxy",
+        action=argparse.BooleanOptionalAction,
+        default=True,
     )
-    anchor_offsets = tuple(range(0, clip_frames, 4))
-    first_start = max(min(rgb), target_start - history_frames)
-    final_start = target_start - clip_frames + 1
-    candidates = []
-    for start in range(first_start, final_start + 1):
-        if not all(start + offset in rgb for offset in range(clip_frames)):
-            continue
-        if not all(start + offset in geometry for offset in anchor_offsets):
-            continue
-        candidates.append(start)
-    if final_start not in candidates:
-        raise ValueError("the causal capture clip ending at target_start is incomplete")
-    if len(candidates) < count:
-        raise ValueError(f"only {len(candidates)} valid capture clips, requested {count}")
-    positions = np.linspace(0, len(candidates) - 1, count).round().astype(np.int64)
-    selected = sorted(set(candidates[int(position)] for position in positions))
-    for start in candidates:
-        if len(selected) == count:
-            break
-        if start not in selected:
-            selected.append(start)
-    selected = sorted(selected)[:count]
-    if selected[-1] != final_start:
-        selected[-1] = final_start
-        selected = sorted(selected)
-    anchor_indices = [
-        start + offset
-        for start in selected
-        for offset in anchor_offsets
-    ]
-    return selected, anchor_indices
+    parser.add_argument("--rclone_transfers", type=int, default=32)
+    parser.add_argument("--rclone_checkers", type=int, default=32)
+    parser.set_defaults(**inherited)
+    args = parser.parse_args()
+    args.checkpoint = checkpoint or _resolve_checkpoint(args.checkpoint)
+    args.item_name = args.item_name.strip().rstrip("/")
+    if not args.model_dir:
+        parser.error(
+            "--model_dir is required unless it is available in the checkpoint's "
+            "training_args.json or --config"
+        )
+    if args.height % 16 or args.width % 16:
+        parser.error("--height and --width must be multiples of 16")
+    if args.steps < 1:
+        parser.error("--steps must be positive")
+    sample_config = _sample_config(args)
+    sample_config.validate()
+    return args
 
 
-def _load_model(args: argparse.Namespace, device: torch.device):
+def _sample_config(args: argparse.Namespace) -> LongTrajectorySampleConfig:
+    return LongTrajectorySampleConfig(
+        height=args.height,
+        width=args.width,
+        capture_clips=args.capture_clips,
+        capture_clip_rgb_frames=args.capture_clip_rgb_frames,
+        preceding_rgb_frames=args.preceding_rgb_frames,
+        reference_frames=args.reference_frames,
+        history_min_frames=args.history_min_frames,
+        history_max_frames=args.history_max_frames,
+        latent_frames_per_chunk=args.latent_frames_per_chunk,
+        samples_per_item=1,
+        min_depth=args.min_depth,
+        max_depth=args.max_depth,
+    )
+
+
+def _memory_config(args: argparse.Namespace) -> MemoryTrainingConfig:
+    # Observed capture RGB-D is clean at inference. Stage 1 training uses these
+    # same values; Stage 2's synthetic memory corruption is a train-only
+    # robustness augmentation and must not be applied to real capture memory.
+    return MemoryTrainingConfig(
+        latent_frames_per_chunk=args.latent_frames_per_chunk,
+        teacher_memory_probability=1.0,
+        memory_update_noise_std=0.0,
+        memory_update_dropout_probability=0.0,
+        timestep_shift=args.timestep_shift,
+        min_depth=args.min_depth,
+        max_depth=args.max_depth,
+        depth_edge_threshold=args.depth_edge_threshold,
+        memory_consistency_threshold=args.memory_consistency_threshold,
+        memory_max_points=args.memory_max_points,
+        memory_voxel_size=args.memory_voxel_size,
+        capture_encode_batch_size=args.capture_encode_batch_size,
+    )
+
+
+class _TargetStartRandom(random.Random):
+    """Force only sample()'s first choice while preserving every later draw."""
+
+    def __init__(self, seed: int, target_start: int | None) -> None:
+        super().__init__(seed)
+        self.target_start = target_start
+        self._used_forced_choice = False
+
+    def choice(self, sequence: Sequence[int]) -> int:
+        if self.target_start is not None and not self._used_forced_choice:
+            self._used_forced_choice = True
+            if self.target_start not in sequence:
+                first = int(sequence[0]) if sequence else None
+                last = int(sequence[-1]) if sequence else None
+                raise ValueError(
+                    f"target_start={self.target_start} is invalid for this item; "
+                    f"valid range is {first}..{last}"
+                )
+            return int(self.target_start)
+        return int(super().choice(sequence))
+
+
+def _dtype(name: str) -> torch.dtype:
+    return {
+        "no": torch.float32,
+        "fp16": torch.float16,
+        "bf16": torch.bfloat16,
+    }[name]
+
+
+def _load_model_and_pipeline(
+    args: argparse.Namespace,
+    device: torch.device,
+) -> tuple[
+    LingBotVideoLatentMemoryModel,
+    LingBotVideoPipeline,
+    torch.Tensor,
+    torch.Tensor,
+    dict[str, Any],
+]:
     payload = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
-    stage = payload.get("stage", "side_branch")
-    indices = tuple(
-        int(value)
-        for value in payload.get("control_block_indices", "0,3,6,9,12,15,18,21").split(",")
-    )
+    state = payload.get("model", payload)
+    stage = str(payload.get("stage", "side_branch"))
+    raw_indices = payload.get("control_block_indices", args.control_block_indices)
+    if isinstance(raw_indices, str):
+        block_indices = tuple(
+            int(value.strip())
+            for value in raw_indices.split(",")
+            if value.strip()
+        )
+    else:
+        block_indices = tuple(int(value) for value in raw_indices)
+    compute_dtype = _dtype(args.mixed_precision)
     backbone = LingBotVideoTransformer3DModel.from_pretrained(
         args.model_dir,
         subfolder="transformer",
-        torch_dtype=torch.bfloat16,
+        torch_dtype=compute_dtype,
     )
     latent_channels = int(backbone.config.in_channels)
-    controlnet = LingBotLatentMemoryControlNet.from_backbone(backbone, indices)
+    controlnet = LingBotLatentMemoryControlNet.from_backbone(
+        backbone,
+        block_indices,
+    )
     if stage == "lora":
         from peft import LoraConfig, get_peft_model
 
         backbone = get_peft_model(
             backbone,
             LoraConfig(
-                r=int(payload.get("lora_rank", 64)),
-                lora_alpha=int(payload.get("lora_alpha", 64)),
+                r=int(payload.get("lora_rank", args.lora_rank)),
+                lora_alpha=int(payload.get("lora_alpha", args.lora_alpha)),
                 lora_dropout=0.0,
                 target_modules=["to_q", "to_k", "to_v", "to_out"],
                 bias="none",
@@ -168,17 +342,19 @@ def _load_model(args: argparse.Namespace, device: torch.device):
         controlnet,
         LatentMetricDepthHead(latent_channels),
     )
-    missing, unexpected = model.load_state_dict(payload["model"], strict=False)
-    trainable_missing = [
+    missing, unexpected = model.load_state_dict(state, strict=False)
+    missing_required = [
         name
         for name in missing
         if name.startswith(("controlnet.", "depth_head."))
         or "lora_" in name
     ]
-    if trainable_missing or unexpected:
+    if missing_required or unexpected:
         raise RuntimeError(
-            f"checkpoint mismatch: missing_trainable={trainable_missing}, unexpected={unexpected}"
+            "checkpoint does not match the latent-memory model: "
+            f"missing_required={missing_required}, unexpected={unexpected}"
         )
+
     patch_context = (
         _patch_qwen3vl_from_pretrained()
         if _patch_qwen3vl_from_pretrained is not None
@@ -190,328 +366,464 @@ def _load_model(args: argparse.Namespace, device: torch.device):
             transformer=backbone,
             trust_remote_code=True,
             torch_dtype={
-                "default": torch.bfloat16,
-                "transformer": torch.bfloat16,
-                "text_encoder": torch.bfloat16,
+                "default": compute_dtype,
+                "transformer": compute_dtype,
+                "text_encoder": compute_dtype,
                 "vae": torch.float32,
             },
         )
-    pipe.to(device)
-    model.to(device).eval()
-    return model, pipe
+    pipe.text_encoder.to(device)
+    with torch.no_grad():
+        prompt_embeds, prompt_mask = pipe.encode_prompt(args.prompt, device=device)
+    pipe.text_encoder.to("cpu")
+    pipe.vae.requires_grad_(False)
+    pipe.vae.eval().to(device)
+    model.requires_grad_(False)
+    model.eval().to(device)
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    checkpoint_info = {
+        "path": str(args.checkpoint),
+        "stage": stage,
+        "step": int(payload.get("step", -1)),
+        "control_block_indices": list(block_indices),
+    }
+    return model, pipe, prompt_embeds.detach(), prompt_mask.detach(), checkpoint_info
+
+
+def _batch_sample(
+    sample: dict[str, torch.Tensor | str],
+    device: torch.device,
+) -> dict[str, torch.Tensor | str]:
+    return {
+        key: value.unsqueeze(0).to(device, non_blocking=True)
+        if torch.is_tensor(value)
+        else value
+        for key, value in sample.items()
+    }
+
+
+def _encode_training_inputs(
+    vae: torch.nn.Module,
+    batch: dict[str, torch.Tensor | str],
+    config: MemoryTrainingConfig,
+    *,
+    generator: torch.Generator,
+    mixed_precision: str,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    device = batch["target_rgb"].device
+    autocast_enabled = (
+        device.type == "cuda"
+        and mixed_precision in {"fp16", "bf16"}
+    )
+    with torch.no_grad(), torch.autocast(
+        device_type=device.type,
+        dtype=_dtype(mixed_precision),
+        enabled=autocast_enabled,
+    ):
+        capture_latents = encode_capture_latents(
+            vae,
+            batch["capture_rgb"],
+            micro_batch_size=config.capture_encode_batch_size,
+            generator=generator,
+        )
+        preceding_latents = encode_video_latents(
+            vae,
+            batch["preceding_rgb"],
+            generator=generator,
+        )
+        reference_latents = encode_reference_latents(
+            vae,
+            batch["reference_rgb"],
+            micro_batch_size=config.capture_encode_batch_size,
+            generator=generator,
+        )
+        target_latents = encode_video_latents(
+            vae,
+            batch["target_rgb"],
+            generator=generator,
+        )
+    if target_latents.shape[2] != config.latent_frames_per_chunk:
+        raise ValueError(
+            f"expected {config.latent_frames_per_chunk} target latents, "
+            f"got {target_latents.shape[2]}"
+        )
+    if capture_latents.shape[1] != batch["capture_c2w"].shape[1]:
+        raise ValueError("capture VAE anchors and capture geometry do not align")
+    if preceding_latents.shape[2] != batch["preceding_c2w"].shape[1]:
+        raise ValueError("preceding VAE anchors and geometry do not align")
+    target_latents = target_latents.clone()
+    target_latents[:, :, 0] = capture_latents[:, -1]
+    return (
+        capture_latents,
+        preceding_latents,
+        reference_latents,
+        target_latents,
+    )
+
+
+def _read_training_conditions(
+    memories,
+    batch: dict[str, torch.Tensor | str],
+    latent_hw: tuple[int, int],
+    image_hw: tuple[int, int],
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    target_k = scale_intrinsics(
+        batch["target_intrinsics"],
+        image_hw,
+        latent_hw,
+    )
+    preceding_k = scale_intrinsics(
+        batch["preceding_intrinsics"],
+        image_hw,
+        latent_hw,
+    )
+    target_rays = make_plucker_rays(
+        batch["target_c2w"],
+        target_k,
+        *latent_hw,
+    ).transpose(1, 2)
+    preceding_rays = make_plucker_rays(
+        batch["preceding_c2w"],
+        preceding_k,
+        *latent_hw,
+    ).transpose(1, 2)
+    condition_c2w = torch.cat(
+        (batch["target_c2w"], batch["preceding_c2w"]),
+        dim=1,
+    )
+    condition_k = torch.cat((target_k, preceding_k), dim=1)
+    readouts = [
+        memory.read(condition_c2w[index], condition_k[index], latent_hw)
+        for index, memory in enumerate(memories)
+    ]
+    return (
+        torch.stack([readout.features for readout in readouts]),
+        torch.stack([readout.visibility for readout in readouts]),
+        torch.stack([readout.depth for readout in readouts]),
+        target_rays,
+        preceding_rays,
+    )
+
+
+def _video_uint8(frames: np.ndarray) -> np.ndarray:
+    return np.clip(np.rint(frames * 255.0), 0, 255).astype(np.uint8)
+
+
+def _write_video(path: Path, frames: np.ndarray, fps: float) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    iio.imwrite(
+        path,
+        _video_uint8(frames),
+        fps=float(fps),
+        codec="libx264",
+        pixelformat="yuv420p",
+    )
+
+
+def _psnr(prediction: np.ndarray, target: np.ndarray) -> float:
+    mse = float(np.square(prediction.astype(np.float64) - target).mean())
+    if mse == 0:
+        return float("inf")
+    return float(-10.0 * math.log10(mse))
+
+
+def _depth_metrics(
+    prediction: torch.Tensor,
+    target: torch.Tensor,
+    valid: torch.Tensor,
+) -> dict[str, float]:
+    mask = (
+        valid.bool()
+        & torch.isfinite(prediction)
+        & torch.isfinite(target)
+        & (prediction > 0)
+        & (target > 0)
+    )
+    if not bool(mask.any()):
+        return {"depth_abs_rel": float("nan"), "depth_rmse": float("nan")}
+    difference = prediction[mask].float() - target[mask].float()
+    return {
+        "depth_abs_rel": float(
+            (difference.abs() / target[mask].float().clamp_min(1e-6)).mean().item()
+        ),
+        "depth_rmse": float(difference.square().mean().sqrt().item()),
+    }
+
+
+def _infer_fps(metadata: dict[str, Any], requested: float | None) -> float:
+    if requested is not None:
+        return float(requested)
+    candidates = (
+        metadata.get("fps"),
+        metadata.get("source_fps"),
+        metadata.get("video_fps"),
+    )
+    for value in candidates:
+        if isinstance(value, (int, float)) and value > 0:
+            return float(value) / float(SOURCE_FRAME_STRIDE)
+    return 6.0
+
+
+def _indices(value: torch.Tensor) -> list[int]:
+    return [int(index) for index in value.reshape(-1).cpu().tolist()]
+
+
+def _source_indices(
+    item: VipeRoomTourItem,
+    internal_indices: Sequence[int],
+) -> list[int]:
+    return [
+        int(
+            item.rgb_source_index_by_index.get(
+                index,
+                index * SOURCE_FRAME_STRIDE,
+            )
+        )
+        for index in internal_indices
+    ]
 
 
 def main() -> None:
     args = parse_args()
-    if args.height % 16 or args.width % 16:
-        raise ValueError("height and width must both be multiples of 16")
-    if args.chunk_latent_frames < 2:
-        raise ValueError("chunk_latent_frames must be at least 2")
-    target_latent_count = (args.num_frames - 1) // 4 + 1
-    if args.num_frames < 1 or (args.num_frames - 1) % 4:
-        raise ValueError(
-            "num_frames must be 4n+1 because LingBot's VAE temporal stride is 4"
-        )
-    if (
-        target_latent_count < args.chunk_latent_frames
-        or (target_latent_count - 1) % (args.chunk_latent_frames - 1)
-    ):
-        rgb_stride = 4 * (args.chunk_latent_frames - 1)
-        raise ValueError(
-            f"num_frames must be {rgb_stride}n+1 and contain at least one chunk"
-        )
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    )
+    if not torch.cuda.is_available():
+        raise RuntimeError("latent-spatial-memory inference requires a CUDA GPU")
     device = torch.device("cuda")
-    generator = torch.Generator(device=device).manual_seed(args.seed)
+    torch.manual_seed(args.generation_seed)
+    generator = torch.Generator(device=device).manual_seed(args.generation_seed)
+    sample_config = _sample_config(args)
+    memory_config = _memory_config(args)
+
     cache = RoomTourItemCache(
         args.dataset_root,
         args.cache_root,
         rclone=RcloneConfig(
+            binary=args.rclone_binary,
             config_path=args.rclone_config,
             clear_proxy=args.rclone_clear_proxy,
+            transfers=args.rclone_transfers,
+            checkers=args.rclone_checkers,
         ),
     )
+    logger.info("materializing scene %s", args.item_name)
     item = VipeRoomTourItem(cache.materialize(args.item_name))
-    capture_clip_starts, capture_indices = _select_capture_clips(
-        item,
-        args.target_start,
-        args.history_frames,
+    sample_rng = _TargetStartRandom(args.sample_seed, args.target_start)
+    sample = item.sample(sample_config, sample_rng)
+    target_start = int(sample["target_rgb_indices"][0].item())
+    logger.info(
+        "sampled target_start=%d (source RGB=%d), capture_clips=%d, target_rgb=%d",
+        target_start,
+        item.rgb_source_index_by_index[target_start],
         args.capture_clips,
-        args.capture_clip_rgb_frames,
-    )
-    target_indices = [
-        args.target_start + 4 * index for index in range(target_latent_count)
-    ]
-    missing_target = [
-        index
-        for index in target_indices
-        if index not in item.pose_by_index or index not in item.intrinsics_by_index
-    ]
-    if missing_target:
-        raise ValueError(f"target trajectory misses calibration frames: {missing_target[:8]}")
-
-    target_hw = (args.height, args.width)
-    source_hw = item.source_hw
-    capture_rgb = torch.stack(
-        [
-            torch.stack(
-                [
-                    item.read_rgb(start + offset, target_hw)
-                    for offset in range(args.capture_clip_rgb_frames)
-                ],
-                dim=1,
-            )
-            for start in capture_clip_starts
-        ]
-    ).unsqueeze(0).to(device)
-    capture_depth = torch.stack(
-        [item.read_depth(index, target_hw) for index in capture_indices]
-    ).to(device)
-    capture_c2w = torch.from_numpy(
-        np.stack([item.pose_by_index[index] for index in capture_indices])
-    ).float().to(device)
-    target_c2w = torch.from_numpy(
-        np.stack([item.pose_by_index[index] for index in target_indices])
-    ).float().to(device)
-    first_capture = capture_c2w[0]
-    capture_c2w = normalize_c2w_to_first_capture(capture_c2w, first_capture)
-    target_c2w = normalize_c2w_to_first_capture(target_c2w, first_capture)
-    capture_k = intrinsics_vector_to_matrix(
-        resize_crop_intrinsics(
-            torch.from_numpy(
-                np.stack([item.intrinsics_by_index[index] for index in capture_indices])
-            ).float().to(device),
-            source_hw,
-            target_hw,
-        )
-    )
-    target_k = intrinsics_vector_to_matrix(
-        resize_crop_intrinsics(
-            torch.from_numpy(
-                np.stack([item.intrinsics_by_index[index] for index in target_indices])
-            ).float().to(device),
-            source_hw,
-            target_hw,
-        )
+        sample_config.target_rgb_frames,
     )
 
-    model, pipe = _load_model(args, device)
-    with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
-        capture_latents = encode_capture_latents(
-            pipe.vae,
-            capture_rgb,
-            micro_batch_size=2,
-            generator=generator,
-        )[0]
-    latent_hw = (capture_latents.shape[-2], capture_latents.shape[-1])
-    capture_k_latent = scale_intrinsics(capture_k, target_hw, latent_hw)
-    target_k_latent = scale_intrinsics(target_k, target_hw, latent_hw)
-    memory = LatentSpatialMemory(
-        capture_latents.shape[1],
-        device=device,
-        feature_dtype=capture_latents.dtype,
-        max_points=args.memory_max_points,
-        voxel_size=args.memory_voxel_size,
+    model, pipe, prompt_embeds, prompt_mask, checkpoint_info = (
+        _load_model_and_pipeline(args, device)
     )
-    for index, frame_index in enumerate(capture_indices):
-        candidate_depth = downsample_depth_bilinear(
-            capture_depth[index],
-            latent_hw,
-        )
-        candidate_valid = depth_validity_mask(
-            candidate_depth,
-            min_depth=args.min_depth,
-            max_depth=args.max_depth,
-            relative_edge_threshold=args.depth_edge_threshold,
-        )
-        if len(memory):
-            existing = memory.read(
-                capture_c2w[index],
-                capture_k_latent[index],
-                latent_hw,
-            )
-            candidate_valid = memory_consistency_mask(
-                candidate_depth,
-                candidate_valid,
-                existing.depth[0, 0],
-                existing.visibility[0, 0],
-                relative_threshold=args.memory_consistency_threshold,
-            )
-        memory.write(
-            capture_latents[index],
-            capture_depth[index],
-            capture_k[index],
-            capture_c2w[index],
-            image_hw=target_hw,
-            valid_mask=candidate_valid,
-            frame_id=frame_index,
-            min_depth=args.min_depth,
-            max_depth=args.max_depth,
-            relative_edge_threshold=args.depth_edge_threshold,
-            compact=False,
-        )
-    memory.compact()
-    reference_latent = capture_latents[:1].permute(1, 0, 2, 3).unsqueeze(0)
-    prompt_embeds, prompt_mask = pipe.encode_prompt(args.prompt, device=device)
-    transformer_dtype = next(model.backbone.parameters()).dtype
+    batch = _batch_sample(sample, device)
+    (
+        capture_latents,
+        preceding_latents,
+        reference_latents,
+        target_latents,
+    ) = _encode_training_inputs(
+        pipe.vae,
+        batch,
+        memory_config,
+        generator=generator,
+        mixed_precision=args.mixed_precision,
+    )
+    image_hw = tuple(int(value) for value in batch["image_hw"][0].tolist())
+    latent_hw = (target_latents.shape[-2], target_latents.shape[-1])
+    memories = build_capture_memories(
+        capture_latents,
+        batch,
+        image_hw=image_hw,
+        config=memory_config,
+    )
+    (
+        memory_latents,
+        memory_visibility,
+        projected_depth,
+        target_rays,
+        preceding_rays,
+    ) = _read_training_conditions(
+        memories,
+        batch,
+        latent_hw,
+        image_hw,
+    )
+    target_frames = target_latents.shape[2]
+    target_depth_latent, target_valid_latent = _downsample_depth_and_valid(
+        batch["target_depth"],
+        batch["target_valid"],
+        latent_hw,
+    )
+    logger.info(
+        "starting %d-step denoising: target_latents=%s memory_points=%d "
+        "visible_fraction=%.4f",
+        args.steps,
+        tuple(target_latents.shape),
+        len(memories[0]),
+        float(memory_visibility[:, :, :target_frames].mean().item()),
+    )
+    generated_latents = denoise_latent_memory_chunk(
+        model,
+        pipe.scheduler,
+        clean_prefix=target_latents[:, :, :1],
+        memory_latents=memory_latents,
+        memory_visibility=memory_visibility,
+        target_rays=target_rays,
+        preceding_latents=preceding_latents,
+        preceding_rays=preceding_rays,
+        reference_latents=reference_latents,
+        prompt_embeds=prompt_embeds,
+        prompt_mask=prompt_mask,
+        num_inference_steps=args.steps,
+        timestep_shift=args.timestep_shift,
+        generator=generator,
+    )
+    predicted_depth = predict_metric_depth(
+        model,
+        generated_latents,
+        target_rays,
+        projected_depth[:, :, :target_frames],
+        memory_visibility[:, :, :target_frames],
+    )
 
-    capture_latents_per_clip = 1 + (args.capture_clip_rgb_frames - 1) // 4
-    if capture_latents_per_clip < 3:
-        raise ValueError("the initial chunk requires a capture clip with >=3 latents")
-    final_clip_latents = capture_latents[-capture_latents_per_clip:]
-    initial_preceding = final_clip_latents[-3:-1].permute(
-        1,
-        0,
-        2,
-        3,
-    ).unsqueeze(0)
-    initial_prefix = final_clip_latents[-1].unsqueeze(0)
-    initial_preceding_c2w = capture_c2w[-3:-1]
-    initial_preceding_k_latent = capture_k_latent[-3:-1]
-
-    all_latents = []
-    all_depths = []
-    generated_latents: list[torch.Tensor] = []
-    prefix = initial_prefix
-    chunk_stride = args.chunk_latent_frames - 1
-    chunk_count = (target_latent_count - 1) // chunk_stride
-    for chunk_index in range(chunk_count):
-        start = chunk_index * chunk_stride
-        end = start + args.chunk_latent_frames
-        chunk_c2w = target_c2w[start:end]
-        chunk_k = target_k_latent[start:end]
-        if chunk_index == 0:
-            preceding_latents = initial_preceding
-            preceding_c2w = initial_preceding_c2w
-            preceding_k = initial_preceding_k_latent
-        else:
-            preceding_start = max(0, start - 2)
-            preceding_latents = torch.stack(
-                generated_latents[preceding_start:start],
-                dim=1,
-            ).unsqueeze(0)
-            preceding_c2w = target_c2w[preceding_start:start]
-            preceding_k = target_k_latent[preceding_start:start]
-        condition_c2w = torch.cat((chunk_c2w, preceding_c2w), dim=0)
-        condition_k = torch.cat((chunk_k, preceding_k), dim=0)
-        readout = memory.read(condition_c2w, condition_k, latent_hw)
-        memory_latents = readout.features.unsqueeze(0)
-        visibility = readout.visibility.unsqueeze(0)
-        projected_depth = readout.depth.unsqueeze(0)
-        rays = make_plucker_rays(
-            chunk_c2w.unsqueeze(0),
-            chunk_k.unsqueeze(0),
-            *latent_hw,
-        ).transpose(1, 2)
-        preceding_rays = make_plucker_rays(
-            preceding_c2w.unsqueeze(0),
-            preceding_k.unsqueeze(0),
-            *latent_hw,
-        ).transpose(1, 2)
-        latents = torch.randn(
-            1,
-            capture_latents.shape[1],
-            args.chunk_latent_frames,
-            *latent_hw,
-            generator=generator,
-            device=device,
-            dtype=torch.float32,
-        )
-        latents[:, :, 0] = prefix
-        pipe.scheduler.set_timesteps(args.steps, device=device, shift=args.shift)
-        for timestep in pipe.scheduler.timesteps:
-            timestep_batch = _transformer_timestep(
-                timestep,
-                transformer_dtype,
-            ).expand(1).to(device)
-            target_timesteps = timestep_batch[:, None].expand(
-                1,
-                args.chunk_latent_frames,
-            ).clone()
-            target_timesteps[:, 0] = 0
-            with torch.no_grad(), _transformer_autocast(device, transformer_dtype):
-                velocity = model(
-                    noisy_latents=latents,
-                    target_timesteps=target_timesteps,
-                    encoder_hidden_states=prompt_embeds.to(transformer_dtype),
-                    encoder_attention_mask=prompt_mask,
-                    memory_latents=memory_latents,
-                    memory_visibility=visibility,
-                    target_rays=rays,
-                    preceding_latents=preceding_latents,
-                    preceding_rays=preceding_rays,
-                    reference_latents=reference_latent,
-                ).velocity.float()
-            latents = pipe.scheduler.step(
-                velocity,
-                timestep,
-                latents,
-                return_dict=False,
-                generator=generator,
-            )[0]
-            latents[:, :, 0] = prefix
-        with torch.no_grad(), _transformer_autocast(device, transformer_dtype):
-            predicted_depth = model.predict_log_depth(
-                latents,
-                rays,
-                projected_depth[:, :, : args.chunk_latent_frames],
-                visibility[:, :, : args.chunk_latent_frames],
-            ).exp().squeeze(1)
-        valid = (
-            torch.isfinite(predicted_depth[0, 1:])
-            & (predicted_depth[0, 1:] >= args.min_depth)
-            & (predicted_depth[0, 1:] <= args.max_depth)
-        )
-        valid = memory_consistency_mask(
-            predicted_depth[0, 1:],
-            valid,
-            projected_depth[0, 0, 1 : args.chunk_latent_frames],
-            visibility[0, 0, 1 : args.chunk_latent_frames],
-            relative_threshold=args.memory_consistency_threshold,
-        )
-        memory.write_video(
-            latents[0, :, 1:].to(capture_latents.dtype),
-            predicted_depth[0, 1:],
-            chunk_k[1:],
-            chunk_c2w[1:],
-            image_hw=latent_hw,
-            valid_masks=valid,
-            frame_ids=torch.tensor(target_indices[start + 1 : end], device=device),
-            min_depth=args.min_depth,
-            max_depth=args.max_depth,
-            relative_edge_threshold=args.depth_edge_threshold,
-        )
-        all_latents.append(latents.cpu() if chunk_index == 0 else latents[:, :, 1:].cpu())
-        all_depths.append(
-            predicted_depth.cpu()
-            if chunk_index == 0
-            else predicted_depth[:, 1:].cpu()
-        )
-        new_generated = latents[0] if chunk_index == 0 else latents[0, :, 1:]
-        generated_latents.extend(
-            list(torch.unbind(new_generated.detach(), dim=1))
-        )
-        prefix = latents[:, :, -1].detach()
-        print(
-            f"chunk {chunk_index + 1}/{chunk_count}: "
-            f"memory_points={len(memory)} visible={float(visibility.mean()):.4f}",
-            flush=True,
-        )
-
-    latent_video = torch.cat(all_latents, dim=2).to(device)
+    logger.info("decoding generated and teacher target latents")
     with torch.no_grad():
-        frames = pipe._decode_latents(latent_video)[0]
-    output = Path(args.output)
-    output.parent.mkdir(parents=True, exist_ok=True)
-    iio.imwrite(output, (frames * 255.0).round().astype(np.uint8), fps=args.fps)
-    np.savez_compressed(
-        output.with_suffix(".depth.npz"),
-        depth=torch.cat(all_depths, dim=1).numpy(),
-        latent_frame_indices=np.asarray(target_indices),
-        normalized_c2w=target_c2w.cpu().numpy(),
-        intrinsics=target_k.cpu().numpy(),
+        generated_rgb = pipe._decode_latents(generated_latents)[0]
+        vae_target_rgb = pipe._decode_latents(target_latents)[0]
+    ground_truth_rgb = (
+        batch["target_rgb"][0]
+        .permute(1, 2, 3, 0)
+        .float()
+        .clamp(0, 1)
+        .cpu()
+        .numpy()
     )
-    del model, pipe
-    gc.collect()
+    generated_rgb = np.asarray(generated_rgb, dtype=np.float32)
+    vae_target_rgb = np.asarray(vae_target_rgb, dtype=np.float32)
+    if generated_rgb.shape != ground_truth_rgb.shape:
+        raise RuntimeError(
+            f"decoded/GT RGB shapes differ: {generated_rgb.shape} vs "
+            f"{ground_truth_rgb.shape}"
+        )
+
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    fps = _infer_fps(item.metadata, args.fps)
+    _write_video(output_dir / "generated.mp4", generated_rgb, fps)
+    _write_video(output_dir / "ground_truth.mp4", ground_truth_rgb, fps)
+    _write_video(output_dir / "vae_reconstruction.mp4", vae_target_rgb, fps)
+    capture_rgb = (
+        sample["capture_rgb"]
+        .permute(0, 2, 3, 4, 1)
+        .reshape(-1, args.height, args.width, 3)
+        .numpy()
+    )
+    preceding_rgb = (
+        sample["preceding_rgb"].permute(1, 2, 3, 0).numpy()
+    )
+    reference_rgb = sample["reference_rgb"].permute(0, 2, 3, 1).numpy()
+    _write_video(output_dir / "conditioning_capture_clips.mp4", capture_rgb, fps)
+    _write_video(output_dir / "conditioning_preceding.mp4", preceding_rgb, fps)
+    if reference_rgb.shape[0]:
+        iio.imwrite(
+            output_dir / "conditioning_references.png",
+            _video_uint8(np.concatenate(list(reference_rgb), axis=1)),
+        )
+    comparison = np.concatenate(
+        (ground_truth_rgb, vae_target_rgb, generated_rgb),
+        axis=2,
+    )
+    _write_video(output_dir / "comparison_gt_vae_generated.mp4", comparison, fps)
+
+    target_internal = _indices(batch["target_rgb_indices"][0])
+    target_latent_internal = _indices(batch["target_latent_indices"][0])
+    capture_internal = _indices(batch["capture_indices"][0])
+    capture_starts = _indices(batch["capture_clip_starts"][0])
+    reference_internal = _indices(batch["reference_indices"][0])
+    preceding_internal = _indices(batch["preceding_rgb_indices"][0])
+    metrics = {
+        "rgb_psnr_generated_vs_gt": _psnr(generated_rgb, ground_truth_rgb),
+        "rgb_psnr_vae_vs_gt": _psnr(vae_target_rgb, ground_truth_rgb),
+        "latent_mse_excluding_overlap": float(
+            torch.nn.functional.mse_loss(
+                generated_latents[:, :, 1:].float(),
+                target_latents[:, :, 1:].float(),
+            ).item()
+        ),
+        "memory_points": len(memories[0]),
+        "visible_fraction": float(
+            memory_visibility[:, :, :target_frames].mean().item()
+        ),
+        **_depth_metrics(
+            predicted_depth,
+            target_depth_latent,
+            target_valid_latent,
+        ),
+    }
+    metadata = {
+        "scene": args.item_name,
+        "dataset_root": args.dataset_root,
+        "checkpoint": checkpoint_info,
+        "model_dir": args.model_dir,
+        "prompt": args.prompt,
+        "sample_seed": args.sample_seed,
+        "generation_seed": args.generation_seed,
+        "steps": args.steps,
+        "timestep_shift": args.timestep_shift,
+        "fps": fps,
+        "image_hw": list(image_hw),
+        "latent_hw": list(latent_hw),
+        "capture_clip_starts_internal": capture_starts,
+        "capture_clip_starts_source": _source_indices(item, capture_starts),
+        "capture_anchor_indices_internal": capture_internal,
+        "capture_anchor_indices_source": _source_indices(item, capture_internal),
+        "reference_indices_internal": reference_internal,
+        "reference_indices_source": _source_indices(item, reference_internal),
+        "preceding_rgb_indices_internal": preceding_internal,
+        "preceding_rgb_indices_source": _source_indices(item, preceding_internal),
+        "target_rgb_indices_internal": target_internal,
+        "target_rgb_indices_source": _source_indices(item, target_internal),
+        "target_latent_indices_internal": target_latent_internal,
+        "target_latent_indices_source": _source_indices(
+            item,
+            target_latent_internal,
+        ),
+        "metrics": metrics,
+        "comparison_order": ["ground_truth", "vae_reconstruction", "generated"],
+    }
+    (output_dir / "metadata.json").write_text(
+        json.dumps(metadata, indent=2, allow_nan=True) + "\n",
+        encoding="utf-8",
+    )
+    np.savez_compressed(
+        output_dir / "geometry_and_depth.npz",
+        predicted_depth=predicted_depth.cpu().numpy(),
+        target_depth_latent=target_depth_latent.float().cpu().numpy(),
+        target_valid_latent=target_valid_latent.cpu().numpy(),
+        target_depth=batch["target_depth"].float().cpu().numpy(),
+        target_valid=batch["target_valid"].cpu().numpy(),
+        target_c2w=batch["target_c2w"].float().cpu().numpy(),
+        target_intrinsics=batch["target_intrinsics"].float().cpu().numpy(),
+        projected_memory_depth=projected_depth[
+            :, :, :target_frames
+        ].float().cpu().numpy(),
+        memory_visibility=memory_visibility[
+            :, :, :target_frames
+        ].float().cpu().numpy(),
+    )
+    logger.info("inference complete: %s", output_dir)
+    logger.info("metrics: %s", json.dumps(metrics, allow_nan=True))
 
 
 if __name__ == "__main__":
