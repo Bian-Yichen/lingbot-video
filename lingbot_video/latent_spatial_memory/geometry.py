@@ -242,10 +242,15 @@ def backproject_depth(
     if intrinsics.shape != (3, 3) or c2w.shape != (4, 4):
         raise ValueError("intrinsics and c2w must be [3,3] and [4,4]")
     height, width = depth.shape
-    grid = pixel_grid(height, width, device=depth.device, dtype=torch.float32)
-    rays_camera = grid.reshape(-1, 3) @ torch.linalg.inv(intrinsics.float()).T
-    points_camera = rays_camera * depth.float().reshape(-1, 1)
-    points_world = points_camera @ c2w[:3, :3].float().T + c2w[:3, 3].float()
+    # 3D memory coordinates must not inherit the outer bf16 training autocast.
+    with torch.amp.autocast(depth.device.type, enabled=False):
+        grid = pixel_grid(height, width, device=depth.device, dtype=torch.float32)
+        rays_camera = grid.reshape(-1, 3) @ torch.linalg.inv(intrinsics.float()).T
+        points_camera = rays_camera * depth.float().reshape(-1, 1)
+        points_world = (
+            points_camera @ c2w[:3, :3].float().T
+            + c2w[:3, 3].float()
+        )
     return points_world.reshape(height, width, 3)
 
 
@@ -264,16 +269,27 @@ def make_plucker_rays(
     if c2w.shape[:-2] != intrinsics.shape[:-2]:
         raise ValueError("pose and intrinsics leading dimensions must match")
     leading = c2w.shape[:-2]
-    flat_c2w = c2w.reshape(-1, 4, 4).float()
-    flat_k = intrinsics.reshape(-1, 3, 3).float()
-    grid = pixel_grid(height, width, device=c2w.device, dtype=torch.float32)
-    grid = grid.reshape(1, height * width, 3).expand(flat_c2w.shape[0], -1, -1)
-    directions_camera = torch.bmm(grid, torch.linalg.inv(flat_k).transpose(1, 2))
-    directions_world = torch.bmm(directions_camera, flat_c2w[:, :3, :3].transpose(1, 2))
-    directions_world = F.normalize(directions_world, dim=-1, eps=1e-6)
-    origins = flat_c2w[:, None, :3, 3].expand_as(directions_world)
-    moments = torch.cross(origins, directions_world, dim=-1)
-    rays = torch.cat((directions_world, moments), dim=-1)
+    with torch.amp.autocast(c2w.device.type, enabled=False):
+        flat_c2w = c2w.reshape(-1, 4, 4).float()
+        flat_k = intrinsics.reshape(-1, 3, 3).float()
+        grid = pixel_grid(height, width, device=c2w.device, dtype=torch.float32)
+        grid = grid.reshape(1, height * width, 3).expand(
+            flat_c2w.shape[0],
+            -1,
+            -1,
+        )
+        directions_camera = torch.bmm(
+            grid,
+            torch.linalg.inv(flat_k).transpose(1, 2),
+        )
+        directions_world = torch.bmm(
+            directions_camera,
+            flat_c2w[:, :3, :3].transpose(1, 2),
+        )
+        directions_world = F.normalize(directions_world, dim=-1, eps=1e-6)
+        origins = flat_c2w[:, None, :3, 3].expand_as(directions_world)
+        moments = torch.cross(origins, directions_world, dim=-1)
+        rays = torch.cat((directions_world, moments), dim=-1)
     rays = rays.reshape(*leading, height, width, 6)
     permutation = list(range(len(leading))) + [len(leading) + 2, len(leading), len(leading) + 1]
     return rays.permute(*permutation).contiguous()
