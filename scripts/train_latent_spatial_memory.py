@@ -61,7 +61,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model_dir", required=False)
     parser.add_argument(
         "--dataset_root",
-        default="h:bianyichen/AnyReconProDataset_labeled/",
+        default="h:bianyichen/AnyReconProDataset_labeled_2/",
     )
     parser.add_argument("--cache_root", default="/tmp/lingbot_latent_memory_cache")
     parser.add_argument("--output_dir", default="outputs/latent_spatial_memory")
