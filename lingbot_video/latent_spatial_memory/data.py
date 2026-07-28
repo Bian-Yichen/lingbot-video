@@ -276,38 +276,56 @@ def _load_npz_mapping(
 
 
 def _decode_exr(payload: bytes) -> np.ndarray:
-    """Decode the Z channel written by ViPE, preferring its OpenEXR dependency."""
+    """Decode the metric Z channel written by VIPE with the OpenEXR bindings."""
 
     with tempfile.NamedTemporaryFile(suffix=".exr") as temporary:
         temporary.write(payload)
         temporary.flush()
         try:
-            import Imath
             import OpenEXR
+        except ImportError as exc:
+            raise RuntimeError(
+                "Depth EXR decoding requires the OpenEXR Python package. Install "
+                "the training dependencies with `python -m pip install -r "
+                "requirements-training.txt`, or install it directly with "
+                "`python -m pip install 'OpenEXR>=3.2'`."
+            ) from exc
 
+        # OpenEXR >=3.3 exposes channels directly as NumPy arrays and no longer
+        # requires callers to construct an Imath pixel type.
+        if hasattr(OpenEXR, "File"):
+            with OpenEXR.File(temporary.name) as file:
+                channels = file.channels()
+                if "Z" not in channels:
+                    raise ValueError(
+                        f"VIPE depth EXR has no Z channel; found {sorted(channels)}"
+                    )
+                depth = np.asarray(channels["Z"].pixels)
+        else:
+            # OpenEXR 3.2 and older bindings use the legacy InputFile API.
+            try:
+                import Imath
+            except ImportError as exc:
+                raise RuntimeError(
+                    "The installed legacy OpenEXR bindings require Imath. "
+                    "Upgrade with `python -m pip install --upgrade 'OpenEXR>=3.3'`."
+                ) from exc
             file = OpenEXR.InputFile(temporary.name)
             try:
                 window = file.header()["dataWindow"]
                 width = int(window.max.x - window.min.x + 1)
                 height = int(window.max.y - window.min.y + 1)
                 raw = file.channel("Z", Imath.PixelType(Imath.PixelType.FLOAT))
-                return np.frombuffer(raw, dtype=np.float32).reshape(height, width).copy()
+                depth = np.frombuffer(raw, dtype=np.float32).reshape(height, width)
             finally:
                 file.close()
-        except ImportError:
-            try:
-                import imageio.v3 as iio
 
-                depth = iio.imread(temporary.name)
-            except Exception as exc:
-                raise RuntimeError(
-                    "Depth EXR decoding needs OpenEXR+Imath (the same packages used by ViPE) "
-                    "or an imageio backend with EXR support."
-                ) from exc
     depth = np.asarray(depth)
-    if depth.ndim == 3:
+    if depth.ndim == 3 and depth.shape[-1] == 1:
         depth = depth[..., 0]
-    return depth.astype(np.float32, copy=False)
+    if depth.ndim != 2:
+        raise ValueError(f"VIPE Z channel must be 2D, got shape {depth.shape}")
+    return depth.astype(np.float32, copy=True)
 
 
 class VipeRoomTourItem:
