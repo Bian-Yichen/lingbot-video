@@ -105,6 +105,37 @@ def test_same_depth_readout_prefers_latest_memory_update() -> None:
     torch.testing.assert_close(readout.depth[0, 0], depth)
 
 
+def test_memory_geometry_stays_fp32_inside_bfloat16_autocast() -> None:
+    height, width = 3, 4
+    depth = torch.full((height, width), 2.0)
+    intrinsics = torch.tensor(
+        [[4.0, 0.0, 1.5], [0.0, 4.0, 1.0], [0.0, 0.0, 1.0]]
+    )
+    c2w = torch.eye(4)
+    memory = LatentSpatialMemory(
+        2,
+        device="cpu",
+        feature_dtype=torch.bfloat16,
+    )
+
+    with torch.amp.autocast("cpu", dtype=torch.bfloat16):
+        memory.write(
+            torch.ones(2, height, width, dtype=torch.bfloat16),
+            depth,
+            intrinsics,
+            c2w,
+            image_hw=(height, width),
+            relative_edge_threshold=0.0,
+        )
+        readout = memory.read(c2w, intrinsics, (height, width))
+
+    assert memory.points.dtype == torch.float32
+    assert readout.depth.dtype == torch.float32
+    assert readout.features.dtype == torch.bfloat16
+    assert bool((readout.visibility == 1).all())
+    torch.testing.assert_close(readout.depth[0, 0], depth)
+
+
 def test_memory_consistency_preserves_unseen_and_rejects_conflicts() -> None:
     candidate = torch.tensor([[2.0, 4.0, 3.0]])
     valid = torch.ones_like(candidate, dtype=torch.bool)
