@@ -8,6 +8,9 @@ from lingbot_video.latent_spatial_memory.geometry import (
     resize_crop_intrinsics,
     scale_intrinsics,
 )
+from lingbot_video.latent_spatial_memory.inference import (
+    denoise_latent_memory_chunk,
+)
 from lingbot_video.latent_spatial_memory.memory import (
     LatentSpatialMemory,
     memory_consistency_mask,
@@ -152,3 +155,62 @@ def test_memory_consistency_preserves_unseen_and_rejects_conflicts() -> None:
         mask,
         torch.tensor([[True, False, True]]),
     )
+
+
+def test_inference_keeps_overlap_clean_at_every_denoising_step() -> None:
+    class DummyOutput:
+        def __init__(self, velocity: torch.Tensor) -> None:
+            self.velocity = velocity
+
+    class DummyModel(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.anchor = torch.nn.Parameter(torch.zeros(()))
+            self.prefixes: list[torch.Tensor] = []
+
+        def forward(self, *, noisy_latents: torch.Tensor, **_kwargs) -> DummyOutput:
+            self.prefixes.append(noisy_latents[:, :, :1].detach().clone())
+            return DummyOutput(torch.zeros_like(noisy_latents))
+
+    class DummyScheduler:
+        def set_timesteps(self, _steps, *, device, shift) -> None:
+            assert shift == 5.0
+            self.timesteps = torch.tensor([1000, 500], device=device)
+
+        def step(
+            self,
+            _velocity,
+            _timestep,
+            sample,
+            *,
+            return_dict,
+            generator,
+        ):
+            assert not return_dict
+            assert generator is not None
+            return (sample + 1.0,)
+
+    model = DummyModel()
+    prefix = torch.full((1, 2, 1, 2, 3), 7.0)
+    preceding = torch.zeros(1, 2, 2, 2, 3)
+    output = denoise_latent_memory_chunk(
+        model,
+        DummyScheduler(),
+        clean_prefix=prefix,
+        memory_latents=torch.zeros(1, 2, 5, 2, 3),
+        memory_visibility=torch.ones(1, 1, 5, 2, 3),
+        target_rays=torch.zeros(1, 6, 3, 2, 3),
+        preceding_latents=preceding,
+        preceding_rays=torch.zeros(1, 6, 2, 2, 3),
+        reference_latents=torch.zeros(1, 2, 4, 2, 3),
+        prompt_embeds=torch.zeros(1, 1, 2),
+        prompt_mask=torch.ones(1, 1),
+        num_inference_steps=2,
+        timestep_shift=5.0,
+        generator=torch.Generator().manual_seed(3),
+        show_progress=False,
+    )
+    torch.testing.assert_close(output[:, :, :1], prefix)
+    assert len(model.prefixes) == 2
+    for observed in model.prefixes:
+        torch.testing.assert_close(observed, prefix)
