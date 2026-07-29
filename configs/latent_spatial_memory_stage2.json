@@ -1,8 +1,8 @@
 {
   "stage": "lora",
-  "dataset_root": "h:bianyichen/AnyReconProDataset_labeled/",
-  "cache_root": "/tmp/lingbot_latent_memory_cache",
-  "output_dir": "outputs/latent_spatial_memory_stage2",
+  "dataset_root": "h:bianyichen/AnyReconProDataset_labeled_2/",
+  "cache_root": "/tmp/lingbot_latent_memory_cache_2",
+  "output_dir": "/mnt/petrelfs/bianyichen/3DVision/lingbot-video-output/train",
   "height": 480,
   "width": 832,
   "capture_clips": 20,
