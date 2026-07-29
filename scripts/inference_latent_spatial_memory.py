@@ -261,11 +261,16 @@ def _memory_config(args: argparse.Namespace) -> MemoryTrainingConfig:
     )
 
 
-class _TargetStartRandom(random.Random):
-    """Force only sample()'s first choice while preserving every later draw."""
+class _TargetStartRandom:
+    """Random wrapper that can force sample()'s first target-window choice.
+
+    Do not subclass ``random.Random`` with an extra constructor argument:
+    CPython 3.10's C-level Random constructor rejects more than one argument
+    before a subclass ``__init__`` can consume it.
+    """
 
     def __init__(self, seed: int, target_start: int | None) -> None:
-        super().__init__(seed)
+        self._random = random.Random(seed)
         self.target_start = target_start
         self._used_forced_choice = False
 
@@ -280,7 +285,10 @@ class _TargetStartRandom(random.Random):
                     f"valid range is {first}..{last}"
                 )
             return int(self.target_start)
-        return int(super().choice(sequence))
+        return int(self._random.choice(sequence))
+
+    def randint(self, start: int, end: int) -> int:
+        return int(self._random.randint(start, end))
 
 
 def _dtype(name: str) -> torch.dtype:
