@@ -21,6 +21,10 @@ We are excited to introduce **LingBot-Video**, the first open-source large-scale
 
 ## 🔥 Latest News
 
+- July 29, 2026: Added GIM-World geometry-aware implicit-memory
+  [training/inference](docs/zh/gim_world_training.md) and a
+  [paper-fidelity audit](docs/zh/gim_world_fidelity_audit.md) for long
+  camera-labelled room tours.
 - July 9, 2026: 🎉 We release the technical report, code, models, rewriters for LingBot-Video.
 
 ## 📦 Model Download

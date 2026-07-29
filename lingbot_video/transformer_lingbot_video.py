@@ -6,6 +6,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.distributed as dist
+from torch.utils.checkpoint import checkpoint
 
 from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.models.attention_dispatch import dispatch_attention_fn
@@ -258,20 +259,41 @@ class LingBotVideoAttention(nn.Module):
                 parallel_config=parallel_config,
             )
         else:
-            if flash_attn_varlen_func_v3 is None:
-                raise RuntimeError("flash_attn_interface.flash_attn_varlen_func is required.")
+            def packed_sdpa(q_flat, k_flat, v_flat):
+                sequence_ends = packed_indices["cu_seqlens_kv"].tolist()
+                outputs = []
+                for start, end in zip(sequence_ends[:-1], sequence_ends[1:]):
+                    query = q_flat[start:end].transpose(0, 1).unsqueeze(0)
+                    key = k_flat[start:end].transpose(0, 1).unsqueeze(0)
+                    value = v_flat[start:end].transpose(0, 1).unsqueeze(0)
+                    result = F.scaled_dot_product_attention(
+                        query,
+                        key,
+                        value,
+                        dropout_p=0.0,
+                        is_causal=False,
+                    )
+                    outputs.append(result.squeeze(0).transpose(0, 1))
+                return torch.cat(outputs, dim=0)
+
             if parallel_config is None:
-                result = flash_attn_varlen_func_v3(
-                    q=q.reshape(-1, self.num_heads, self.head_dim),
-                    k=k.reshape(-1, self.num_heads, self.head_dim),
-                    v=v.reshape(-1, self.num_heads, self.head_dim),
-                    cu_seqlens_q=packed_indices["cu_seqlens_kv"],
-                    cu_seqlens_k=packed_indices["cu_seqlens_kv"],
-                    max_seqlen_q=packed_indices["max_seqlen_in_batch_kv"],
-                    max_seqlen_k=packed_indices["max_seqlen_in_batch_kv"],
-                    causal=False,
-                )
-                out = result[0] if isinstance(result, tuple) else result
+                q_flat = q.reshape(-1, self.num_heads, self.head_dim)
+                k_flat = k.reshape(-1, self.num_heads, self.head_dim)
+                v_flat = v.reshape(-1, self.num_heads, self.head_dim)
+                if flash_attn_varlen_func_v3 is None:
+                    out = packed_sdpa(q_flat, k_flat, v_flat)
+                else:
+                    result = flash_attn_varlen_func_v3(
+                        q=q_flat,
+                        k=k_flat,
+                        v=v_flat,
+                        cu_seqlens_q=packed_indices["cu_seqlens_kv"],
+                        cu_seqlens_k=packed_indices["cu_seqlens_kv"],
+                        max_seqlen_q=packed_indices["max_seqlen_in_batch_kv"],
+                        max_seqlen_k=packed_indices["max_seqlen_in_batch_kv"],
+                        causal=False,
+                    )
+                    out = result[0] if isinstance(result, tuple) else result
                 out = out.reshape(B, S, self.num_heads, self.head_dim)
             else:
                 group = parallel_config.context_parallel_config._ulysses_mesh.get_group()
@@ -298,17 +320,20 @@ class LingBotVideoAttention(nn.Module):
                 q_flat = q_global.reshape(-1, local_heads, self.head_dim)
                 k_flat = k_global.reshape(-1, local_heads, self.head_dim)
                 v_flat = v_global.reshape(-1, local_heads, self.head_dim)
-                result = flash_attn_varlen_func_v3(
-                    q=q_flat,
-                    k=k_flat,
-                    v=v_flat,
-                    cu_seqlens_q=packed_indices["cu_seqlens_kv"],
-                    cu_seqlens_k=packed_indices["cu_seqlens_kv"],
-                    max_seqlen_q=packed_indices["max_seqlen_in_batch_kv"],
-                    max_seqlen_k=packed_indices["max_seqlen_in_batch_kv"],
-                    causal=False,
-                )
-                out_global = result[0] if isinstance(result, tuple) else result
+                if flash_attn_varlen_func_v3 is None:
+                    out_global = packed_sdpa(q_flat, k_flat, v_flat)
+                else:
+                    result = flash_attn_varlen_func_v3(
+                        q=q_flat,
+                        k=k_flat,
+                        v=v_flat,
+                        cu_seqlens_q=packed_indices["cu_seqlens_kv"],
+                        cu_seqlens_k=packed_indices["cu_seqlens_kv"],
+                        max_seqlen_q=packed_indices["max_seqlen_in_batch_kv"],
+                        max_seqlen_k=packed_indices["max_seqlen_in_batch_kv"],
+                        causal=False,
+                    )
+                    out_global = result[0] if isinstance(result, tuple) else result
                 out_global = out_global.reshape(B, S * world_size, local_heads * self.head_dim)
                 out = _all_to_all_split_cat(
                     out_global,
@@ -966,7 +991,7 @@ class LingBotVideoBlock(nn.Module):
 
 
 class LingBotVideoTransformer3DModel(ModelMixin, ConfigMixin):
-    _supports_gradient_checkpointing = False
+    _supports_gradient_checkpointing = True
     _no_split_modules = ["LingBotVideoBlock"]
     _keep_in_fp32_modules = list(LINGBOT_VIDEO_FP32_MODULES)
 
@@ -1031,6 +1056,7 @@ class LingBotVideoTransformer3DModel(ModelMixin, ConfigMixin):
         routed_scaling_factor: float = 1.0,
     ):
         super().__init__()
+        self.gradient_checkpointing = False
         head_dim = hidden_size // num_attention_heads
         assert head_dim == sum(axes_dims), f"head_dim {head_dim} != sum(axes_dims) {sum(axes_dims)}"
         mlp_only_layers = tuple(mlp_only_layers)
@@ -1100,12 +1126,14 @@ class LingBotVideoTransformer3DModel(ModelMixin, ConfigMixin):
         timestep: torch.Tensor,                  # (B,) ∈ [0, 1000](= sigma*1000)
         encoder_hidden_states: torch.Tensor,     # (B, L, text_dim)
         encoder_attention_mask: Optional[torch.Tensor] = None,  # (B, L) 1=valid
+        memory_hidden_states: Optional[torch.Tensor] = None,  # (B, M*H'*W', hidden_size)
+        video_action_embeds: Optional[torch.Tensor] = None,  # (B, T', hidden_size)
         return_dict: bool = True,
     ):
         B, C, T, H, W = hidden_states.shape
         pF, pH, pW = self.config.patch_size
         gt, gh, gw = T // pF, H // pH, W // pW
-        n_video = gt * gh * gw
+        n_target_video = gt * gh * gw
         L = encoder_hidden_states.shape[1]
         device = hidden_states.device
         if encoder_attention_mask is not None:
@@ -1119,17 +1147,48 @@ class LingBotVideoTransformer3DModel(ModelMixin, ConfigMixin):
         patch_tokens = hidden_states.reshape(B, C, gt, pF, gh, pH, gw, pW)
         patch_tokens = patch_tokens.permute(0, 2, 4, 6, 3, 5, 7, 1).reshape(
             B,
-            n_video,
+            n_target_video,
             pF * pH * pW * C,
         )
         if packed_batch:
-            packed_patch_tokens = patch_tokens.reshape(1, B * n_video, -1)
             x = torch.cat(
                 [self.patch_embedder(patch_tokens[i : i + 1]) for i in range(B)],
                 dim=1,
             )
         else:
             x = self.patch_embedder(patch_tokens)
+
+        memory_tokens_per_sample = 0
+        memory_frames = 0
+        if memory_hidden_states is not None:
+            if memory_hidden_states.ndim != 3:
+                raise ValueError("memory_hidden_states must be [B,M,D]")
+            if memory_hidden_states.shape[0] != B:
+                raise ValueError("memory batch size must match hidden_states")
+            if memory_hidden_states.shape[-1] != self.config.hidden_size:
+                raise ValueError("memory hidden size must match the backbone")
+            memory_tokens_per_sample = int(memory_hidden_states.shape[1])
+            spatial_tokens = gh * gw
+            if memory_tokens_per_sample % spatial_tokens:
+                raise ValueError(
+                    "memory token count must be a whole number of target patch grids"
+                )
+            memory_frames = memory_tokens_per_sample // spatial_tokens
+            if packed_batch:
+                video_parts = [
+                    torch.cat(
+                        (
+                            memory_hidden_states[i : i + 1],
+                            x[:, i * n_target_video : (i + 1) * n_target_video],
+                        ),
+                        dim=1,
+                    )
+                    for i in range(B)
+                ]
+                x = torch.cat(video_parts, dim=1)
+            else:
+                x = torch.cat((memory_hidden_states, x), dim=1)
+        n_conditioned_video = memory_tokens_per_sample + n_target_video
 
         if packed_batch:
             text_parts = [
@@ -1139,7 +1198,7 @@ class LingBotVideoTransformer3DModel(ModelMixin, ConfigMixin):
             text = torch.cat(text_parts, dim=1)
             joint = _cat_interleave(
                 x,
-                [n_video] * B,
+                [n_conditioned_video] * B,
                 text,
                 text_lens_list,
             )
@@ -1150,7 +1209,15 @@ class LingBotVideoTransformer3DModel(ModelMixin, ConfigMixin):
 
         # Per-sample RoPE: video t-axis start = real text length of this sample + 1
         rotary_parts = [
-            self.rope(make_joint_position_ids(text_lens_list[i], gt, gh, gw, device))
+            self.rope(
+                make_joint_position_ids(
+                    text_lens_list[i],
+                    memory_frames + gt,
+                    gh,
+                    gw,
+                    device,
+                )
+            )
             for i in range(B)
         ]
         if packed_batch:
@@ -1166,7 +1233,10 @@ class LingBotVideoTransformer3DModel(ModelMixin, ConfigMixin):
         packed_indices = None
         has_padding = encoder_attention_mask is not None and bool((text_lens < L).any())
         if packed_batch or use_packed_attention:
-            sample_seq_lens = [n_video + text_len for text_len in text_lens_list]
+            sample_seq_lens = [
+                n_conditioned_video + text_len
+                for text_len in text_lens_list
+            ]
             cu_seqlens = torch.zeros(B + 1, device=device, dtype=torch.int32)
             cu_seqlens[1:] = torch.cumsum(
                 torch.tensor(sample_seq_lens, device=device, dtype=torch.int32),
@@ -1179,7 +1249,8 @@ class LingBotVideoTransformer3DModel(ModelMixin, ConfigMixin):
             has_padding = False
         if has_padding:
             key_mask = torch.cat(
-                [torch.ones(B, n_video, dtype=torch.bool, device=device),
+                [
+                 torch.ones(B, n_conditioned_video, dtype=torch.bool, device=device),
                  encoder_attention_mask.bool()],
                 dim=1,
             )
@@ -1236,14 +1307,48 @@ class LingBotVideoTransformer3DModel(ModelMixin, ConfigMixin):
         timestep_for_embed = timestep.float()
         timestep_proj = self.time_proj(timestep_for_embed)
         t_emb = self.time_embedder(timestep_proj)                            # (B, D)
-        if packed_batch:
-            temb_input = torch.cat(
-                [
-                    t_emb[i : i + 1].unsqueeze(1).expand(1, n_video + text_lens_list[i], -1)
-                    for i in range(B)
-                ],
-                dim=1,
+        action_tokens = None
+        if video_action_embeds is not None:
+            if video_action_embeds.shape != (B, gt, self.config.hidden_size):
+                raise ValueError(
+                    "video_action_embeds must be [B,target_latent_frames,hidden_size]; "
+                    f"got {tuple(video_action_embeds.shape)}"
+                )
+            target_action_tokens = (
+                video_action_embeds[:, :, None, :]
+                .expand(B, gt, gh * gw, self.config.hidden_size)
+                .reshape(B, n_target_video, self.config.hidden_size)
             )
+            if memory_tokens_per_sample:
+                memory_actions = torch.zeros(
+                    B,
+                    memory_tokens_per_sample,
+                    self.config.hidden_size,
+                    device=device,
+                    dtype=target_action_tokens.dtype,
+                )
+                target_action_tokens = torch.cat(
+                    (memory_actions, target_action_tokens),
+                    dim=1,
+                )
+            action_tokens = target_action_tokens
+        if packed_batch:
+            temb_parts = []
+            for i in range(B):
+                video_temb = t_emb[i : i + 1].unsqueeze(1).expand(
+                    1,
+                    n_conditioned_video,
+                    -1,
+                )
+                if action_tokens is not None:
+                    video_temb = video_temb + action_tokens[i : i + 1]
+                text_temb = t_emb[i : i + 1].unsqueeze(1).expand(
+                    1,
+                    text_lens_list[i],
+                    -1,
+                )
+                temb_parts.extend((video_temb, text_temb))
+            temb_input = torch.cat(temb_parts, dim=1)
             if padding_size:
                 temb_input = torch.cat(
                     [
@@ -1262,6 +1367,21 @@ class LingBotVideoTransformer3DModel(ModelMixin, ConfigMixin):
             temb6 = temb6.reshape(1, joint_seq_len, -1)
         else:
             temb_input = t_emb.unsqueeze(1).expand(B, joint_seq_len, -1)       # (B, S, D)
+            if action_tokens is not None:
+                action_joint = torch.cat(
+                    (
+                        action_tokens,
+                        torch.zeros(
+                            B,
+                            L,
+                            self.config.hidden_size,
+                            device=device,
+                            dtype=action_tokens.dtype,
+                        ),
+                    ),
+                    dim=1,
+                )
+                temb_input = temb_input + action_joint
             temb6 = self.time_modulation(temb_input.reshape(B * joint_seq_len, -1))
             temb6 = temb6.reshape(B, joint_seq_len, -1)                        # (B, S, 6D)
 
@@ -1273,15 +1393,44 @@ class LingBotVideoTransformer3DModel(ModelMixin, ConfigMixin):
         temb6 = temb6.reshape(temb6.shape[0] * temb6.shape[1], -1)
 
         for block in self.blocks:
-            joint = block(
-                joint,
-                temb6,
-                rotary,
-                attention_mask,
-                moe_padding_mask,
-                packed_indices=packed_indices,
-                parallel_config=parallel_config,
-            )
+            if (
+                self.gradient_checkpointing
+                and self.training
+                and torch.is_grad_enabled()
+            ):
+                def custom_forward(
+                    hidden_states,
+                    modulation,
+                    rotary_embedding,
+                    module=block,
+                ):
+                    return module(
+                        hidden_states,
+                        modulation,
+                        rotary_embedding,
+                        attention_mask,
+                        moe_padding_mask,
+                        packed_indices=packed_indices,
+                        parallel_config=parallel_config,
+                    )
+
+                joint = checkpoint(
+                    custom_forward,
+                    joint,
+                    temb6,
+                    rotary,
+                    use_reentrant=False,
+                )
+            else:
+                joint = block(
+                    joint,
+                    temb6,
+                    rotary,
+                    attention_mask,
+                    moe_padding_mask,
+                    packed_indices=packed_indices,
+                    parallel_config=parallel_config,
+                )
         if not packed_cp:
             joint = self.cp_out(joint)
 
@@ -1296,11 +1445,19 @@ class LingBotVideoTransformer3DModel(ModelMixin, ConfigMixin):
         if packed_batch:
             split_lengths: list[int] = []
             for text_len in text_lens_list:
-                split_lengths.extend([n_video, text_len])
+                split_lengths.extend([n_conditioned_video, text_len])
             parts = torch.split(projected, split_lengths, dim=1)
-            x = torch.cat(parts[::2], dim=1).reshape(B, n_video, -1)
+            video_projected = torch.cat(parts[::2], dim=1).reshape(
+                B,
+                n_conditioned_video,
+                -1,
+            )
         else:
-            x = projected[:, :n_video]
+            video_projected = projected[:, :n_conditioned_video]
+        x = video_projected[
+            :,
+            memory_tokens_per_sample : memory_tokens_per_sample + n_target_video,
+        ]
 
         # unpatchify (matches the rearrange in postprocess)
         Cout = self.config.out_channels
