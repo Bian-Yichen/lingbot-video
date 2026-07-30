@@ -7,6 +7,7 @@ import json
 import logging
 import math
 import sys
+import time
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -282,6 +283,168 @@ def _count_parameters(module: torch.nn.Module) -> tuple[int, int]:
         if parameter.requires_grad
     )
     return total, trainable
+
+
+def _gather_scene_records(
+    record: dict[str, Any],
+    accelerator: Accelerator,
+) -> list[dict[str, Any]]:
+    """Collect one lightweight scene record per rank for ordered logging."""
+    if accelerator.num_processes == 1:
+        return [record]
+    if not torch.distributed.is_available():
+        raise RuntimeError(
+            "multi-process scene logging requires torch.distributed"
+        )
+    if not torch.distributed.is_initialized():
+        raise RuntimeError(
+            "Accelerate reports multiple processes but the distributed "
+            "process group is not initialized"
+        )
+    gathered: list[dict[str, Any] | None] = [
+        None for _ in range(accelerator.num_processes)
+    ]
+    torch.distributed.all_gather_object(gathered, record)
+    return [item for item in gathered if item is not None]
+
+
+def _distributed_mean_metrics(
+    output: dict[str, torch.Tensor],
+    sample: RoomTourSample,
+    *,
+    update_probability: float,
+    optimizer: torch.optim.Optimizer,
+    accelerator: Accelerator,
+) -> dict[str, float]:
+    """Average optimizer-step metrics across all distributed ranks."""
+    tensor_metrics = {
+        **{
+            f"train/{key}": value.detach().float()
+            for key, value in output.items()
+        },
+        "train/capture_rgb_frames": output["loss"].new_tensor(
+            len(sample.capture_rgb_indices),
+            dtype=torch.float32,
+        ),
+        "train/capture_window_rgb_frames": output["loss"].new_tensor(
+            sample.capture_window_end - sample.capture_window_start + 1,
+            dtype=torch.float32,
+        ),
+        "train/capture_frame_stride": output["loss"].new_tensor(
+            sample.capture_frame_stride,
+            dtype=torch.float32,
+        ),
+    }
+    names = tuple(tensor_metrics)
+    local_values = torch.stack(
+        [tensor_metrics[name] for name in names],
+        dim=0,
+    ).reshape(1, -1)
+    gathered_values = accelerator.gather(local_values)
+    mean_values = gathered_values.reshape(-1, len(names)).mean(dim=0)
+    metrics = {
+        name: float(value.item())
+        for name, value in zip(names, mean_values, strict=True)
+    }
+    metrics.update(
+        {
+            "train/learning_rate": float(optimizer.param_groups[0]["lr"]),
+            "train/predicted_update_probability": update_probability,
+        }
+    )
+    return metrics
+
+
+def _scene_record(
+    output: dict[str, torch.Tensor],
+    sample: RoomTourSample,
+    *,
+    accelerator: Accelerator,
+    epoch: int,
+    num_epochs: int,
+    scene_step: int,
+    scene_steps: int,
+    accumulation_position: int,
+    accumulation_group_size: int,
+    global_step: int,
+    did_optimizer_step: bool,
+    elapsed_seconds: float,
+) -> dict[str, Any]:
+    return {
+        "rank": accelerator.process_index,
+        "epoch": epoch + 1,
+        "num_epochs": num_epochs,
+        "iteration": scene_step + 1,
+        "iterations": scene_steps,
+        "item": sample.item_name,
+        "global_step": global_step,
+        "did_optimizer_step": did_optimizer_step,
+        "accumulation_position": accumulation_position,
+        "accumulation_group_size": accumulation_group_size,
+        "loss": float(output["loss"].detach().float().item()),
+        "flow_loss": float(output["flow_loss"].detach().float().item()),
+        "geometry_loss": float(
+            output["geometry_loss"].detach().float().item()
+        ),
+        "sigma": float(output["sigma"].detach().float().item()),
+        "history_candidates": float(
+            output["history_candidates"].detach().float().item()
+        ),
+        "history_retained": float(
+            output["history_retained"].detach().float().item()
+        ),
+        "capture_latent_frames": float(
+            output["capture_latent_frames"].detach().float().item()
+        ),
+        "memory_norm": float(
+            output["memory_norm"].detach().float().item()
+        ),
+        "capture_window_start": sample.capture_window_start,
+        "capture_window_end": sample.capture_window_end,
+        "capture_frame_stride": sample.capture_frame_stride,
+        "capture_rgb_frames": len(sample.capture_rgb_indices),
+        "query_start": sample.query_start,
+        "query_end": sample.query_rgb_blocks[-1][-1],
+        "overlap_score": sample.trajectory_overlap_score,
+        "elapsed_seconds": elapsed_seconds,
+    }
+
+
+def _log_scene_record(record: dict[str, Any]) -> None:
+    logger.info(
+        "scene epoch=%d/%d iter=%d/%d rank=%d item=%s "
+        "global_step=%d optimizer_step=%s accumulation=%d/%d "
+        "loss=%.6g flow_loss=%.6g geometry_loss=%.6g sigma=%.4f "
+        "window=%d:%d stride=%d capture_rgb=%d capture_latents=%.0f "
+        "query=%d:%d overlap=%.4f history=%.0f/%.0f "
+        "memory_norm=%.6g elapsed=%.1fs",
+        record["epoch"],
+        record["num_epochs"],
+        record["iteration"],
+        record["iterations"],
+        record["rank"],
+        record["item"],
+        record["global_step"],
+        "yes" if record["did_optimizer_step"] else "no",
+        record["accumulation_position"],
+        record["accumulation_group_size"],
+        record["loss"],
+        record["flow_loss"],
+        record["geometry_loss"],
+        record["sigma"],
+        record["capture_window_start"],
+        record["capture_window_end"],
+        record["capture_frame_stride"],
+        record["capture_rgb_frames"],
+        record["capture_latent_frames"],
+        record["query_start"],
+        record["query_end"],
+        record["overlap_score"],
+        record["history_retained"],
+        record["history_candidates"],
+        record["memory_norm"],
+        record["elapsed_seconds"],
+    )
 
 
 def _checkpoint_file(value: str) -> Path:
@@ -566,6 +729,10 @@ def main() -> None:
         "effective_scene_batch_size": (
             accelerator.num_processes * args.gradient_accumulation_steps
         ),
+        "terminal_scene_logging": (
+            "every_iteration_all_ranks_gathered_to_main_process"
+        ),
+        "tensorboard_metric_reduction": "mean_across_distributed_ranks",
         "learning_rate": args.learning_rate,
         "num_train_epochs": args.num_train_epochs,
     }
@@ -649,6 +816,7 @@ def main() -> None:
             )
 
         for scene_step, sample in enumerate(dataloader):
+            scene_started_at = time.perf_counter()
             # Both capture and every target block are freshly read and encoded.
             # The online VAE work intentionally happens once per scene sample.
             prepared = prepare_gim_trajectory_online(
@@ -701,53 +869,45 @@ def main() -> None:
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
 
-            if not accelerator.sync_gradients:
-                continue
-            global_step += 1
-            metrics = {
-                f"train/{key}": float(value.detach().float().item())
-                for key, value in output.items()
-            }
-            metrics.update(
-                {
-                    "train/learning_rate": float(
-                        optimizer.param_groups[0]["lr"]
-                    ),
-                    "train/epoch": float(epoch),
-                    "train/capture_rgb_frames": float(
-                        len(sample.capture_rgb_indices)
-                    ),
-                    "train/capture_window_rgb_frames": float(
-                        sample.capture_window_end
-                        - sample.capture_window_start
-                        + 1
-                    ),
-                    "train/capture_frame_stride": float(
-                        sample.capture_frame_stride
-                    ),
-                    "train/predicted_update_probability": (
-                        update_probability
-                    ),
-                }
+            did_optimizer_step = bool(accelerator.sync_gradients)
+            if did_optimizer_step:
+                global_step += 1
+
+            record = _scene_record(
+                output,
+                sample,
+                accelerator=accelerator,
+                epoch=epoch,
+                num_epochs=args.num_train_epochs,
+                scene_step=scene_step,
+                scene_steps=len(dataloader),
+                accumulation_position=accumulation_offset + 1,
+                accumulation_group_size=accumulation_group_size,
+                global_step=global_step,
+                did_optimizer_step=did_optimizer_step,
+                elapsed_seconds=time.perf_counter() - scene_started_at,
             )
+            gathered_records = _gather_scene_records(record, accelerator)
+            if accelerator.is_main_process:
+                for gathered_record in gathered_records:
+                    _log_scene_record(gathered_record)
+
+            if not did_optimizer_step:
+                continue
+            metrics = _distributed_mean_metrics(
+                output,
+                sample,
+                update_probability=update_probability,
+                optimizer=optimizer,
+                accelerator=accelerator,
+            )
+            metrics["train/epoch"] = float(epoch)
             accelerator.log(metrics, step=global_step)
             if global_step % args.log_every == 0 and accelerator.is_main_process:
                 logger.info(
-                    "step=%d epoch=%d scene=%d/%d item=%s "
-                    "window=%d:%d stride=%d capture_rgb=%d "
-                    "query=%d:%d score=%.4f %s",
+                    "optimizer step=%d epoch=%d distributed_mean %s",
                     global_step,
                     epoch + 1,
-                    scene_step + 1,
-                    len(dataloader),
-                    sample.item_name,
-                    sample.capture_window_start,
-                    sample.capture_window_end,
-                    sample.capture_frame_stride,
-                    len(sample.capture_rgb_indices),
-                    sample.query_start,
-                    sample.query_rgb_blocks[-1][-1],
-                    sample.trajectory_overlap_score,
                     " ".join(
                         f"{key}={value:.6g}"
                         for key, value in metrics.items()
