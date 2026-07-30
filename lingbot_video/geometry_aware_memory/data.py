@@ -88,17 +88,16 @@ def _load_npz_mapping(path: Path) -> dict[int, np.ndarray]:
 class GeometryMemorySampleConfig:
     height: int = 480
     width: int = 832
-    target_rgb_frames: int = 81
-    query_blocks: int = 2
+    target_rgb_frames: int = 49
+    query_blocks: int = 1
     vae_temporal_stride: int = 4
-    capture_min_rgb_frames: int = 257
-    capture_max_rgb_frames: int = 801
-    capture_curriculum_start_max_rgb_frames: int = 321
-    capture_curriculum_epochs: int = 5
-    capture_min_fraction_of_current_max: float = 0.75
-    capture_query_guard_rgb_frames: int = 32
-    trajectory_candidate_trials: int = 128
-    trajectory_topk: int = 8
+    capture_window_min_rgb_frames: int = 257
+    capture_window_max_rgb_frames: int = 1000
+    capture_window_curriculum_start_max_rgb_frames: int = 321
+    capture_window_curriculum_epochs: int = 5
+    capture_window_min_fraction_of_current_max: float = 0.75
+    capture_frame_stride_min: int = 2
+    capture_frame_stride_max: int = 3
     trajectory_pose_stride: int = 4
     trajectory_rotation_weight: float = 0.25
 
@@ -115,42 +114,40 @@ class GeometryMemorySampleConfig:
             raise ValueError(
                 "target_rgb_frames must equal 1 + k * vae_temporal_stride"
             )
-        if self.capture_min_rgb_frames < 2:
-            raise ValueError("capture_min_rgb_frames must be at least 2")
-        if self.capture_min_rgb_frames > self.capture_max_rgb_frames:
+        if self.capture_window_min_rgb_frames < 2:
+            raise ValueError("capture_window_min_rgb_frames must be at least 2")
+        if (
+            self.capture_window_min_rgb_frames
+            > self.capture_window_max_rgb_frames
+        ):
             raise ValueError(
-                "capture_min_rgb_frames cannot exceed capture_max_rgb_frames"
+                "capture_window_min_rgb_frames cannot exceed "
+                "capture_window_max_rgb_frames"
             )
         if not (
-            self.capture_min_rgb_frames
-            <= self.capture_curriculum_start_max_rgb_frames
-            <= self.capture_max_rgb_frames
+            self.capture_window_min_rgb_frames
+            <= self.capture_window_curriculum_start_max_rgb_frames
+            <= self.capture_window_max_rgb_frames
         ):
             raise ValueError(
-                "capture curriculum start max must lie inside capture bounds"
+                "capture-window curriculum start max must lie inside "
+                "capture-window bounds"
             )
-        for name, value in (
-            ("capture_min_rgb_frames", self.capture_min_rgb_frames),
-            ("capture_max_rgb_frames", self.capture_max_rgb_frames),
-            (
-                "capture_curriculum_start_max_rgb_frames",
-                self.capture_curriculum_start_max_rgb_frames,
-            ),
-        ):
-            if (value - 1) % self.vae_temporal_stride:
-                raise ValueError(
-                    f"{name} must equal 1 + k * vae_temporal_stride"
-                )
-        if self.capture_curriculum_epochs < 0:
-            raise ValueError("capture_curriculum_epochs cannot be negative")
-        if not 0 < self.capture_min_fraction_of_current_max <= 1:
+        if self.capture_window_curriculum_epochs < 0:
             raise ValueError(
-                "capture_min_fraction_of_current_max must be in (0,1]"
+                "capture_window_curriculum_epochs cannot be negative"
             )
-        if self.capture_query_guard_rgb_frames < 0:
-            raise ValueError("capture_query_guard_rgb_frames cannot be negative")
-        if self.trajectory_candidate_trials < 1 or self.trajectory_topk < 1:
-            raise ValueError("trajectory candidate trials/topk must be positive")
+        if not 0 < self.capture_window_min_fraction_of_current_max <= 1:
+            raise ValueError(
+                "capture_window_min_fraction_of_current_max must be in (0,1]"
+            )
+        if self.capture_frame_stride_min < 2:
+            raise ValueError("capture_frame_stride_min must be at least 2")
+        if self.capture_frame_stride_min > self.capture_frame_stride_max:
+            raise ValueError(
+                "capture_frame_stride_min cannot exceed "
+                "capture_frame_stride_max"
+            )
         if self.trajectory_pose_stride < 1:
             raise ValueError("trajectory_pose_stride must be positive")
         if self.trajectory_rotation_weight < 0:
@@ -164,36 +161,28 @@ class GeometryMemorySampleConfig:
     def query_rgb_frames(self) -> int:
         return self.query_blocks * self.target_rgb_frames
 
-    def capture_max_for_epoch(self, epoch: int) -> int:
-        if self.capture_curriculum_epochs <= 1:
-            return self.capture_max_rgb_frames
+    def capture_window_max_for_epoch(self, epoch: int) -> int:
+        if self.capture_window_curriculum_epochs <= 1:
+            return self.capture_window_max_rgb_frames
         progress = min(
-            max(epoch, 0) / (self.capture_curriculum_epochs - 1),
+            max(epoch, 0) / (self.capture_window_curriculum_epochs - 1),
             1.0,
         )
-        raw = self.capture_curriculum_start_max_rgb_frames + progress * (
-            self.capture_max_rgb_frames
-            - self.capture_curriculum_start_max_rgb_frames
+        raw = self.capture_window_curriculum_start_max_rgb_frames + progress * (
+            self.capture_window_max_rgb_frames
+            - self.capture_window_curriculum_start_max_rgb_frames
         )
-        stride = self.vae_temporal_stride
-        aligned = 1 + ((int(raw) - 1) // stride) * stride
-        return max(self.capture_min_rgb_frames, aligned)
+        return max(self.capture_window_min_rgb_frames, int(raw))
 
-    def capture_bounds_for_epoch(self, epoch: int) -> tuple[int, int]:
-        maximum = self.capture_max_for_epoch(epoch)
-        stride = self.vae_temporal_stride
+    def capture_window_bounds_for_epoch(self, epoch: int) -> tuple[int, int]:
+        maximum = self.capture_window_max_for_epoch(epoch)
         fractional_minimum = int(
-            maximum * self.capture_min_fraction_of_current_max
+            maximum * self.capture_window_min_fraction_of_current_max
         )
-        fractional_minimum = (
-            1
-            + (
-                (fractional_minimum - 1 + stride - 1)
-                // stride
-            )
-            * stride
+        minimum = max(
+            self.capture_window_min_rgb_frames,
+            fractional_minimum,
         )
-        minimum = max(self.capture_min_rgb_frames, fractional_minimum)
         return min(minimum, maximum), maximum
 
 
@@ -202,6 +191,10 @@ class RoomTourSample:
     item_name: str
     local_root: str
     epoch: int
+    capture_window_start: int
+    capture_window_end: int
+    capture_frame_stride: int
+    query_phase_offset: int
     capture_rgb_indices: tuple[int, ...]
     query_rgb_blocks: tuple[tuple[int, ...], ...]
     geometry_query_indices: tuple[int, ...]
@@ -413,66 +406,112 @@ class VipeRoomTourItem:
         nearest = pair_cost.min(axis=1)
         return float(np.median(nearest) + 0.25 * np.quantile(nearest, 0.9))
 
-    def _random_pair_candidate(
+    def _valid_capture_shapes(
+        self,
+        config: GeometryMemorySampleConfig,
+        epoch: int,
+    ) -> list[tuple[int, int]]:
+        """Return (capture_stride, selected_capture_frames) choices.
+
+        A capture stream contains ``1 + 4k`` RGB frames so the causal Wan VAE
+        ends on a complete temporal group.  Its source window span is
+        ``1 + (capture_frames - 1) * capture_stride``.  Query uses a different
+        phase of the same regular subsampling lattice and therefore contains
+        one fewer frame than capture before the fixed-length crop.
+        """
+
+        lower, upper = config.capture_window_bounds_for_epoch(epoch)
+        upper = min(upper, len(self.indices))
+        choices: list[tuple[int, int]] = []
+        for capture_stride in range(
+            config.capture_frame_stride_min,
+            config.capture_frame_stride_max + 1,
+        ):
+            for capture_frames in range(
+                1 + config.vae_temporal_stride,
+                len(self.indices) + 1,
+                config.vae_temporal_stride,
+            ):
+                window_frames = (
+                    1 + (capture_frames - 1) * capture_stride
+                )
+                if window_frames > upper:
+                    break
+                if (
+                    window_frames >= lower
+                    and capture_frames - 1 >= config.query_rgb_frames
+                ):
+                    choices.append((capture_stride, capture_frames))
+        return choices
+
+    def _random_interleaved_candidate(
         self,
         config: GeometryMemorySampleConfig,
         rng: random.Random,
         epoch: int,
-    ) -> tuple[tuple[int, ...], tuple[int, ...]]:
-        first, last = self.indices[0], self.indices[-1]
-        query_length = config.query_rgb_frames
-        guard = config.capture_query_guard_rgb_frames
-        configured_minimum, configured_maximum = (
-            config.capture_bounds_for_epoch(epoch)
-        )
-        maximum = min(
-            configured_maximum,
-            len(self.indices) - query_length - guard,
-        )
-        stride = config.vae_temporal_stride
-        maximum = 1 + ((maximum - 1) // stride) * stride
-        lengths = list(
-            range(configured_minimum, maximum + 1, stride)
-        )
-        if not lengths:
+    ) -> tuple[
+        int,
+        int,
+        int,
+        int,
+        tuple[int, ...],
+        tuple[int, ...],
+    ]:
+        choices = self._valid_capture_shapes(config, epoch)
+        if not choices:
+            lower, upper = config.capture_window_bounds_for_epoch(epoch)
             raise RuntimeError(
-                f"{self.root.name} is too short for capture>="
-                f"{configured_minimum}, query={query_length}, "
-                f"guard={guard}"
+                f"{self.root.name} has no interleaved sample for "
+                f"capture_window={lower}..{upper}, "
+                f"capture_stride={config.capture_frame_stride_min}.."
+                f"{config.capture_frame_stride_max}, "
+                f"query_rgb={config.query_rgb_frames}"
             )
-        capture_length = rng.choice(lengths)
-        # Choose the side on which the independent query trajectory lies
-        # before drawing a capture start. This guarantees that every sampled
-        # capture leaves enough room for the complete query and guard.
-        latest_capture_start = last - capture_length + 1
-        sides: list[tuple[str, int, int]] = []
-        before_minimum = first + query_length + guard
-        if before_minimum <= latest_capture_start:
-            sides.append(("before", before_minimum, latest_capture_start))
-        after_maximum = last - capture_length - guard - query_length + 1
-        if first <= after_maximum:
-            sides.append(("after", first, after_maximum))
-        if not sides:
-            raise RuntimeError("no isolated capture/query placement exists")
-        side, capture_start_min, capture_start_max = rng.choice(sides)
-        capture_start = rng.randint(capture_start_min, capture_start_max)
-        capture_end = capture_start + capture_length - 1
-
-        if side == "before":
-            query_start = rng.randint(
-                first,
-                capture_start - guard - query_length,
-            )
-        else:
-            query_start = rng.randint(
-                capture_end + guard + 1,
-                last - query_length + 1,
-            )
-        capture = tuple(
-            range(capture_start, capture_start + capture_length)
+        valid_strides = sorted({stride for stride, _ in choices})
+        capture_stride = rng.choice(valid_strides)
+        capture_frames = rng.choice(
+            [
+                frames
+                for stride, frames in choices
+                if stride == capture_stride
+            ]
         )
-        query = tuple(range(query_start, query_start + query_length))
-        return capture, query
+        window_frames = 1 + (capture_frames - 1) * capture_stride
+        first = self.indices[0]
+        window_start = rng.randint(
+            first,
+            self.indices[-1] - window_frames + 1,
+        )
+        window_end = window_start + window_frames - 1
+        capture = tuple(
+            range(window_start, window_end + 1, capture_stride)
+        )
+
+        # A fixed non-zero lattice phase gives query a regular frame interval,
+        # which is required for treating it as one causal VAE video stream.
+        query_phase = rng.randint(1, capture_stride - 1)
+        query_candidates = tuple(
+            range(
+                window_start + query_phase,
+                window_end,
+                capture_stride,
+            )
+        )
+        query_offset = rng.randint(
+            0,
+            len(query_candidates) - config.query_rgb_frames,
+        )
+        query = query_candidates[
+            query_offset : query_offset + config.query_rgb_frames
+        ]
+        return (
+            window_start,
+            window_end,
+            capture_stride,
+            query_phase,
+            capture,
+            query,
+        )
 
     def make_sample(
         self,
@@ -483,27 +522,54 @@ class VipeRoomTourItem:
         capture_start: Optional[int] = None,
         query_start: Optional[int] = None,
         capture_rgb_frames: Optional[int] = None,
+        capture_frame_stride: Optional[int] = None,
     ) -> RoomTourSample:
         config.validate()
-        if (capture_start is None) != (query_start is None):
+        explicit = (
+            capture_start,
+            query_start,
+            capture_rgb_frames,
+            capture_frame_stride,
+        )
+        if any(value is not None for value in explicit) and not all(
+            value is not None for value in explicit
+        ):
             raise ValueError(
-                "capture_start and query_start must be supplied together"
+                "explicit sampling requires capture_start, query_start, "
+                "capture_rgb_frames, and capture_frame_stride together"
             )
         if capture_start is not None:
-            capture_length = (
-                config.capture_max_for_epoch(epoch)
-                if capture_rgb_frames is None
-                else int(capture_rgb_frames)
-            )
+            capture_length = int(capture_rgb_frames)
+            sparse_stride = int(capture_frame_stride)
+            if sparse_stride < 2:
+                raise ValueError("capture_frame_stride must be at least 2")
             if (capture_length - 1) % config.vae_temporal_stride:
                 raise ValueError(
                     "capture_rgb_frames must equal 1 + k * vae_temporal_stride"
                 )
-            capture = tuple(
-                range(int(capture_start), int(capture_start) + capture_length)
+            window_start = int(capture_start)
+            window_end = (
+                window_start + (capture_length - 1) * sparse_stride
             )
+            capture = tuple(
+                range(
+                    window_start,
+                    window_end + 1,
+                    sparse_stride,
+                )
+            )
+            query_phase = (int(query_start) - window_start) % sparse_stride
+            if query_phase == 0:
+                raise ValueError(
+                    "query_start lies on the capture subsampling phase"
+                )
             query = tuple(
-                range(int(query_start), int(query_start) + config.query_rgb_frames)
+                range(
+                    int(query_start),
+                    int(query_start)
+                    + config.query_rgb_frames * sparse_stride,
+                    sparse_stride,
+                )
             )
             missing = (set(capture) | set(query)) - set(self.indices)
             if missing:
@@ -511,50 +577,24 @@ class VipeRoomTourItem:
                     f"explicit trajectory indices are out of range: "
                     f"{sorted(missing)[:8]}"
                 )
-            gap = max(
-                query[0] - capture[-1] - 1,
-                capture[0] - query[-1] - 1,
-            )
-            if gap < config.capture_query_guard_rgb_frames:
+            if query[0] < window_start or query[-1] > window_end:
                 raise ValueError(
-                    "capture/query windows overlap or violate the temporal guard"
+                    "explicit query must lie inside the capture window"
                 )
-            candidates = [
-                (
-                    self._trajectory_overlap_score(
-                        capture,
-                        query,
-                        config,
-                    ),
-                    capture,
-                    query,
-                )
-            ]
         else:
-            unique: dict[
-                tuple[int, int, int],
-                tuple[float, tuple[int, ...], tuple[int, ...]],
-            ] = {}
-            for _ in range(config.trajectory_candidate_trials):
-                capture, query = self._random_pair_candidate(
-                    config,
-                    rng,
-                    epoch,
-                )
-                key = (capture[0], len(capture), query[0])
-                if key not in unique:
-                    unique[key] = (
-                        self._trajectory_overlap_score(
-                            capture,
-                            query,
-                            config,
-                        ),
-                        capture,
-                        query,
-                    )
-            candidates = sorted(unique.values(), key=lambda value: value[0])
-        top = candidates[: min(config.trajectory_topk, len(candidates))]
-        overlap_score, capture, query = rng.choice(top)
+            (
+                window_start,
+                window_end,
+                sparse_stride,
+                query_phase,
+                capture,
+                query,
+            ) = self._random_interleaved_candidate(config, rng, epoch)
+        overlap_score = self._trajectory_overlap_score(
+            capture,
+            query,
+            config,
+        )
         blocks = tuple(
             tuple(
                 query[
@@ -569,6 +609,10 @@ class VipeRoomTourItem:
             item_name=self.root.name,
             local_root=str(self.root),
             epoch=int(epoch),
+            capture_window_start=window_start,
+            capture_window_end=window_end,
+            capture_frame_stride=sparse_stride,
+            query_phase_offset=query_phase,
             capture_rgb_indices=capture,
             query_rgb_blocks=blocks,
             geometry_query_indices=geometry_queries,
@@ -578,7 +622,7 @@ class VipeRoomTourItem:
 
 
 class LocalVipeRoomTourDataset(Dataset[RoomTourSample]):
-    """One randomized capture/query trajectory pair per scene and epoch."""
+    """One randomized interleaved capture/query sample per scene and epoch."""
 
     def __init__(
         self,

@@ -232,9 +232,12 @@ def prepare_gim_trajectory_online(
         sample.image_hw,
         origin_index=origin_index,
     )
-    capture_times = (
-        torch.arange(len(capture_latent_indices), dtype=torch.long)
-        * vae_temporal_stride
+    capture_times = torch.tensor(
+        [
+            int(index) - origin_index
+            for index in capture_latent_indices
+        ],
+        dtype=torch.long,
     )
 
     query_blocks: list[PreparedQueryBlock] = []
@@ -333,7 +336,7 @@ def gim_trajectory_training_step(
     compute_dtype: torch.dtype,
     backward: Callable[[torch.Tensor], None] | None = None,
 ) -> dict[str, torch.Tensor]:
-    """Train consecutive query blocks and update memory between the blocks."""
+    """Train query blocks, updating memory only between supervised blocks."""
 
     history_latents = batch.capture_latents
     history_c2w = batch.capture_c2w
@@ -348,7 +351,8 @@ def gim_trajectory_training_step(
     retained_counts: list[torch.Tensor] = []
     predicted_updates: list[torch.Tensor] = []
 
-    for block in batch.query_blocks:
+    for block_index, block in enumerate(batch.query_blocks):
+        history_candidates_before = history_latents.shape[2]
         selected_latents, selected_c2w, selected_k, selected = _select_history(
             history_latents,
             history_c2w,
@@ -421,35 +425,48 @@ def gim_trajectory_training_step(
         )
         loss = flow_loss + config.geometry_loss_weight * geometry_loss
 
-        use_prediction = (
-            config.predicted_update_probability > 0
-            and float(torch.rand((), device=device).item())
-            < config.predicted_update_probability
-        )
-        if use_prediction:
-            update_latents = noisy - sigma_broadcast * predicted
-        else:
-            update_latents = target
-        update_latents = update_latents.detach().cpu()
-        next_time = int(history_times.max().item()) + config.vae_temporal_stride
-        update_times = (
-            torch.arange(
-                update_latents.shape[2],
-                dtype=history_times.dtype,
+        # A write is useful only when another target block follows and can
+        # train against the updated memory.  The default one-block schedule
+        # therefore performs no self-forcing or teacher-forced memory update.
+        has_next_block = block_index + 1 < len(batch.query_blocks)
+        use_prediction = False
+        if has_next_block:
+            use_prediction = (
+                config.predicted_update_probability > 0
+                and float(torch.rand((), device=device).item())
+                < config.predicted_update_probability
             )
-            * config.vae_temporal_stride
-            + next_time
-        )
-        history_latents = torch.cat(
-            (history_latents, update_latents),
-            dim=2,
-        )
-        history_c2w = torch.cat((history_c2w, block.c2w.cpu()), dim=1)
-        history_intrinsics = torch.cat(
-            (history_intrinsics, block.intrinsics.cpu()),
-            dim=1,
-        )
-        history_times = torch.cat((history_times, update_times), dim=0)
+            if use_prediction:
+                update_latents = noisy - sigma_broadcast * predicted
+            else:
+                update_latents = target
+            update_latents = update_latents.detach().cpu()
+            latent_time_step = (
+                batch.sample.capture_frame_stride
+                * config.vae_temporal_stride
+            )
+            next_time = int(history_times.max().item()) + latent_time_step
+            update_times = (
+                torch.arange(
+                    update_latents.shape[2],
+                    dtype=history_times.dtype,
+                )
+                * latent_time_step
+                + next_time
+            )
+            history_latents = torch.cat(
+                (history_latents, update_latents),
+                dim=2,
+            )
+            history_c2w = torch.cat(
+                (history_c2w, block.c2w.cpu()),
+                dim=1,
+            )
+            history_intrinsics = torch.cat(
+                (history_intrinsics, block.intrinsics.cpu()),
+                dim=1,
+            )
+            history_times = torch.cat((history_times, update_times), dim=0)
 
         if backward is None:
             losses.append(loss)
@@ -467,10 +484,7 @@ def gim_trajectory_training_step(
         )
         candidate_counts.append(
             torch.tensor(
-                float(
-                    history_latents.shape[2]
-                    - update_latents.shape[2]
-                ),
+                float(history_candidates_before),
                 device=device,
             )
         )

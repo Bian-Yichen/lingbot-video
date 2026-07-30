@@ -64,8 +64,7 @@ def _config_defaults() -> dict[str, Any]:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Roll out an independent query-camera trajectory from one long "
-            "continuous capture trajectory."
+            "Roll out a withheld query phase from one sparse capture window."
         )
     )
     parser.add_argument("--config", required=True)
@@ -77,6 +76,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--capture_start", type=int, default=None)
     parser.add_argument("--query_start", type=int, default=None)
     parser.add_argument("--capture_rgb_frames", type=int, default=None)
+    parser.add_argument("--capture_frame_stride", type=int, default=None)
     parser.add_argument("--sample_epoch", type=int, default=None)
     parser.add_argument("--prompt", default=None)
     parser.add_argument("--negative_prompt", default=DEFAULT_NEGATIVE_PROMPT)
@@ -84,7 +84,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--num_blocks",
         type=int,
-        default=2,
+        default=1,
         help="Each block generates one target_rgb_frames clip and writes it back.",
     )
     parser.add_argument("--guidance_scale", type=float, default=6.0)
@@ -103,12 +103,18 @@ def parse_args() -> argparse.Namespace:
             parser.error(f"--{name} is required (it may be supplied by --config)")
     if args.num_blocks < 1:
         parser.error("--num_blocks must be positive")
-    if (args.capture_start is None) != (args.query_start is None):
-        parser.error("--capture_start and --query_start must be set together")
-    if args.capture_rgb_frames is not None and args.capture_start is None:
+    explicit = (
+        args.capture_start,
+        args.query_start,
+        args.capture_rgb_frames,
+        args.capture_frame_stride,
+    )
+    if any(value is not None for value in explicit) and not all(
+        value is not None for value in explicit
+    ):
         parser.error(
-            "--capture_rgb_frames requires explicit --capture_start and "
-            "--query_start"
+            "explicit sampling requires --capture_start, --query_start, "
+            "--capture_rgb_frames, and --capture_frame_stride together"
         )
     if args.negative_prompt is None:
         args.negative_prompt = DEFAULT_NEGATIVE_PROMPT
@@ -153,6 +159,13 @@ def main() -> None:
         weights_only=False,
     )
     training_config = checkpoint.get("training_config", {})
+    if "capture_window_min_rgb_frames" not in training_config:
+        raise ValueError(
+            "checkpoint was trained with the previous extrapolative sampler; "
+            "it is not data-compatible with interleaved capture/query "
+            "inference. Retrain from this branch or run the checkpoint from "
+            "the earlier commit."
+        )
     model_dir = args.model_dir or training_config.get("model_dir")
     if not model_dir:
         raise ValueError(
@@ -210,41 +223,41 @@ def main() -> None:
         height=model_config.image_height,
         width=model_config.image_width,
         target_rgb_frames=int(
-            training_config.get("target_rgb_frames", 81)
+            training_config.get("target_rgb_frames", 49)
         ),
         query_blocks=args.num_blocks,
         vae_temporal_stride=int(
             training_config.get("vae_temporal_stride", 4)
         ),
-        capture_min_rgb_frames=int(
-            training_config.get("capture_min_rgb_frames", 257)
+        capture_window_min_rgb_frames=int(
+            training_config.get("capture_window_min_rgb_frames", 257)
         ),
-        capture_max_rgb_frames=int(
-            training_config.get("capture_max_rgb_frames", 801)
+        capture_window_max_rgb_frames=int(
+            training_config.get("capture_window_max_rgb_frames", 1000)
         ),
-        capture_curriculum_start_max_rgb_frames=int(
+        capture_window_curriculum_start_max_rgb_frames=int(
             training_config.get(
-                "capture_curriculum_start_max_rgb_frames",
+                "capture_window_curriculum_start_max_rgb_frames",
                 321,
             )
         ),
-        capture_curriculum_epochs=int(
-            training_config.get("capture_curriculum_epochs", 5)
-        ),
-        capture_min_fraction_of_current_max=float(
+        capture_window_curriculum_epochs=int(
             training_config.get(
-                "capture_min_fraction_of_current_max",
+                "capture_window_curriculum_epochs",
+                5,
+            )
+        ),
+        capture_window_min_fraction_of_current_max=float(
+            training_config.get(
+                "capture_window_min_fraction_of_current_max",
                 0.75,
             )
         ),
-        capture_query_guard_rgb_frames=int(
-            training_config.get("capture_query_guard_rgb_frames", 32)
+        capture_frame_stride_min=int(
+            training_config.get("capture_frame_stride_min", 2)
         ),
-        trajectory_candidate_trials=int(
-            training_config.get("trajectory_candidate_trials", 128)
-        ),
-        trajectory_topk=int(
-            training_config.get("trajectory_topk", 8)
+        capture_frame_stride_max=int(
+            training_config.get("capture_frame_stride_max", 3)
         ),
         trajectory_pose_stride=int(
             training_config.get("trajectory_pose_stride", 4)
@@ -254,7 +267,7 @@ def main() -> None:
         ),
     )
     sample_epoch = (
-        max(sample_config.capture_curriculum_epochs - 1, 0)
+        max(sample_config.capture_window_curriculum_epochs - 1, 0)
         if args.sample_epoch is None
         else args.sample_epoch
     )
@@ -265,13 +278,16 @@ def main() -> None:
         capture_start=args.capture_start,
         query_start=args.query_start,
         capture_rgb_frames=args.capture_rgb_frames,
+        capture_frame_stride=args.capture_frame_stride,
     )
     logger.info(
-        "scene=%s capture=%d:%d (%d RGB) query=%d:%d (%d blocks) "
+        "scene=%s window=%d:%d stride=%d capture=%d RGB "
+        "query=%d:%d (%d blocks) "
         "coverage_score=%.4f",
         args.item_name,
-        sample.capture_start,
-        sample.capture_rgb_indices[-1],
+        sample.capture_window_start,
+        sample.capture_window_end,
+        sample.capture_frame_stride,
         len(sample.capture_rgb_indices),
         sample.query_start,
         sample.query_rgb_blocks[-1][-1],
@@ -301,9 +317,12 @@ def main() -> None:
         sample.image_hw,
         origin_index=sample.capture_start,
     )
-    capture_times = (
-        torch.arange(len(capture_latent_indices), dtype=torch.long)
-        * sample_config.vae_temporal_stride
+    capture_times = torch.tensor(
+        [
+            int(index) - sample.capture_start
+            for index in capture_latent_indices
+        ],
+        dtype=torch.long,
     )
     history_state = DynamicGIMHistory(
         latents=capture_latents,
@@ -431,13 +450,15 @@ def main() -> None:
             retained_times = history_state.times[retained_positions].tolist()
             next_time = (
                 int(history_state.times.max().item())
-                + sample_config.vae_temporal_stride
+                + sample.capture_frame_stride
+                * sample_config.vae_temporal_stride
             )
             update_times = (
                 torch.arange(
                     latents.shape[2],
                     dtype=history_state.times.dtype,
                 )
+                * sample.capture_frame_stride
                 * sample_config.vae_temporal_stride
                 + next_time
             )
@@ -489,6 +510,12 @@ def main() -> None:
         "checkpoint": str(checkpoint_path),
         "item_name": args.item_name,
         "dataset_root": args.dataset_root,
+        "capture_window_internal_range": [
+            sample.capture_window_start,
+            sample.capture_window_end,
+        ],
+        "capture_frame_stride": sample.capture_frame_stride,
+        "query_phase_offset": sample.query_phase_offset,
         "capture_rgb_indices": list(sample.capture_rgb_indices),
         "query_rgb_blocks": [
             list(block) for block in sample.query_rgb_blocks

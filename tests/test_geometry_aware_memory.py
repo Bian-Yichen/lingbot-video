@@ -48,29 +48,29 @@ def test_trajectory_lengths_must_match_causal_vae_stride() -> None:
         GeometryMemorySampleConfig(
             target_rgb_frames=80,
         ).validate()
-    with pytest.raises(ValueError, match="capture_min_rgb_frames"):
+    with pytest.raises(ValueError, match="capture_frame_stride_min"):
         GeometryMemorySampleConfig(
-            capture_min_rgb_frames=256,
+            capture_frame_stride_min=1,
         ).validate()
 
 
 def test_capture_curriculum_reaches_full_length() -> None:
     config = GeometryMemorySampleConfig(
-        capture_min_rgb_frames=257,
-        capture_curriculum_start_max_rgb_frames=321,
-        capture_max_rgb_frames=801,
-        capture_curriculum_epochs=5,
+        capture_window_min_rgb_frames=257,
+        capture_window_curriculum_start_max_rgb_frames=321,
+        capture_window_max_rgb_frames=1000,
+        capture_window_curriculum_epochs=5,
     )
-    assert config.capture_max_for_epoch(0) == 321
-    assert config.capture_max_for_epoch(2) == 561
-    assert config.capture_max_for_epoch(4) == 801
-    assert config.capture_max_for_epoch(99) == 801
-    assert config.capture_bounds_for_epoch(0) == (257, 321)
-    assert config.capture_bounds_for_epoch(2) == (421, 561)
-    assert config.capture_bounds_for_epoch(4) == (601, 801)
+    assert config.capture_window_max_for_epoch(0) == 321
+    assert config.capture_window_max_for_epoch(2) == 660
+    assert config.capture_window_max_for_epoch(4) == 1000
+    assert config.capture_window_max_for_epoch(99) == 1000
+    assert config.capture_window_bounds_for_epoch(0) == (257, 321)
+    assert config.capture_window_bounds_for_epoch(2) == (495, 660)
+    assert config.capture_window_bounds_for_epoch(4) == (750, 1000)
 
 
-def test_sample_is_continuous_disjoint_capture_and_query() -> None:
+def test_sample_is_interleaved_uniform_disjoint_capture_and_query() -> None:
     item = VipeRoomTourItem.__new__(VipeRoomTourItem)
     item.root = Path("/fake/scene.mp4")
     item.indices = list(range(1000))
@@ -82,27 +82,37 @@ def test_sample_is_continuous_disjoint_capture_and_query() -> None:
         pose[2, 3] = index / 1000.0
         item.pose_by_index[index] = pose
     config = GeometryMemorySampleConfig(
-        query_blocks=2,
-        capture_min_rgb_frames=257,
-        capture_curriculum_start_max_rgb_frames=321,
-        capture_max_rgb_frames=321,
-        capture_curriculum_epochs=0,
-        capture_query_guard_rgb_frames=32,
-        trajectory_candidate_trials=16,
-        trajectory_topk=4,
+        target_rgb_frames=49,
+        query_blocks=1,
+        capture_window_min_rgb_frames=257,
+        capture_window_curriculum_start_max_rgb_frames=321,
+        capture_window_max_rgb_frames=321,
+        capture_window_curriculum_epochs=0,
+        capture_frame_stride_min=2,
+        capture_frame_stride_max=3,
     )
     sample = item.make_sample(config, random.Random(7))
     capture = sample.capture_rgb_indices
     query = tuple(
         index for block in sample.query_rgb_blocks for index in block
     )
-    assert capture == tuple(range(capture[0], capture[-1] + 1))
-    assert query == tuple(range(query[0], query[-1] + 1))
+    assert all(
+        right - left == sample.capture_frame_stride
+        for left, right in zip(capture, capture[1:])
+    )
+    assert all(
+        right - left == sample.capture_frame_stride
+        for left, right in zip(query, query[1:])
+    )
     assert set(capture).isdisjoint(query)
-    gap = max(query[0] - capture[-1] - 1, capture[0] - query[-1] - 1)
-    assert gap >= config.capture_query_guard_rgb_frames
-    assert len(sample.query_rgb_blocks) == 2
-    assert all(len(block) == 81 for block in sample.query_rgb_blocks)
+    assert sample.capture_window_start <= query[0]
+    assert query[-1] <= sample.capture_window_end
+    assert (
+        query[0] - sample.capture_window_start
+    ) % sample.capture_frame_stride == sample.query_phase_offset
+    assert len(sample.query_rgb_blocks) == 1
+    assert len(sample.query_rgb_blocks[0]) == 49
+    assert (len(capture) - 1) % config.vae_temporal_stride == 0
 
 
 def test_ray_at_principal_point_is_camera_forward() -> None:
