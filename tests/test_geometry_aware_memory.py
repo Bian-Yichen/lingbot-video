@@ -10,8 +10,11 @@ import torch
 
 import lingbot_video.transformer_lingbot_video as lingbot_transformer
 from lingbot_video.geometry_aware_memory.data import (
+    estimate_sparse_frame_count,
     GeometryMemorySampleConfig,
+    has_interleaved_sample_for_frame_count,
     LocalRoomTourIndex,
+    LocalVipeRoomTourDataset,
     VipeRoomTourItem,
 )
 from lingbot_video.geometry_aware_memory.memory_encoder import (
@@ -48,6 +51,68 @@ def test_local_roomtour_index_uses_mounted_scene_in_place(tmp_path) -> None:
     assert index.item_path("scene_000.mp4") == scene
     with pytest.raises(ValueError, match="direct child"):
         index.item_path("../scene_000.mp4")
+
+
+def test_filename_frame_count_and_epoch_scene_filtering(tmp_path) -> None:
+    short_name = "qv2GbEEaivI_000000_001182.mp4"
+    medium_name = "medium_000000_002500.mp4"
+    long_name = "long_000000_005000.mp4"
+    for item_name in (short_name, medium_name, long_name):
+        (tmp_path / item_name).mkdir()
+    assert estimate_sparse_frame_count(short_name) == 236
+    assert estimate_sparse_frame_count(medium_name) == 500
+    assert estimate_sparse_frame_count(long_name) == 1000
+
+    config = GeometryMemorySampleConfig(
+        target_rgb_frames=81,
+        capture_window_min_rgb_frames=257,
+        capture_window_curriculum_start_max_rgb_frames=321,
+        capture_window_max_rgb_frames=1000,
+        capture_window_curriculum_epochs=3,
+    )
+    dataset = LocalVipeRoomTourDataset(
+        tmp_path,
+        config,
+        item_list=[short_name, medium_name, long_name],
+    )
+    assert dataset.total_item_count == 3
+    assert dataset.items == [medium_name, long_name]
+    assert dataset.skipped_items == (short_name,)
+
+    dataset.set_epoch(2)
+    assert dataset.items == [long_name]
+    assert dataset.skipped_items == (short_name, medium_name)
+
+
+def test_frame_count_filter_includes_exact_valid_boundary() -> None:
+    config = GeometryMemorySampleConfig(
+        target_rgb_frames=81,
+        capture_window_min_rgb_frames=257,
+        capture_window_curriculum_start_max_rgb_frames=321,
+        capture_window_max_rgb_frames=321,
+        capture_window_curriculum_epochs=0,
+    )
+    assert not has_interleaved_sample_for_frame_count(256, config, 0)
+    assert has_interleaved_sample_for_frame_count(257, config, 0)
+
+
+def test_fast_frame_count_filter_matches_exact_shape_enumeration() -> None:
+    config = GeometryMemorySampleConfig(
+        target_rgb_frames=81,
+        capture_window_min_rgb_frames=257,
+        capture_window_curriculum_start_max_rgb_frames=321,
+        capture_window_max_rgb_frames=1000,
+        capture_window_curriculum_epochs=3,
+    )
+    item = VipeRoomTourItem.__new__(VipeRoomTourItem)
+    for epoch in range(3):
+        for frame_count in (168, 169, 236, 256, 257, 321, 500, 750, 1000):
+            item.indices = list(range(frame_count))
+            assert has_interleaved_sample_for_frame_count(
+                frame_count,
+                config,
+                epoch,
+            ) == bool(item._valid_capture_shapes(config, epoch))
 
 
 def test_trajectory_lengths_must_match_causal_vae_stride() -> None:
