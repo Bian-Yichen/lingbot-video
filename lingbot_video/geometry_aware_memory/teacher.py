@@ -2,8 +2,6 @@ from __future__ import annotations
 
 import contextlib
 from dataclasses import dataclass
-from pathlib import Path
-from typing import Optional
 
 import torch
 import torch.nn.functional as F
@@ -15,7 +13,6 @@ class VGGTTeacherConfig:
     input_width: int = 518
     patch_size: int = 14
     feature_dim: int = 2048
-    cache_dir: Optional[str] = None
 
 
 def vggt_target_hw(
@@ -84,23 +81,6 @@ class VGGTGeometryTeacher:
         self.model.track_head = None
         self.model.requires_grad_(False)
         self.model.eval().to(device)
-        self.cache_dir = Path(config.cache_dir) if config.cache_dir else None
-        if self.cache_dir is not None:
-            self.cache_dir.mkdir(parents=True, exist_ok=True)
-
-    def _cache_path(
-        self,
-        item_name: str,
-        frame_index: int,
-        input_hw: tuple[int, int],
-    ) -> Optional[Path]:
-        if self.cache_dir is None:
-            return None
-        safe_model = self.config.model_id.replace("/", "--")
-        height, width = input_hw
-        directory = self.cache_dir / safe_model / item_name
-        directory.mkdir(parents=True, exist_ok=True)
-        return directory / f"{frame_index:06d}_{height}x{width}.pt"
 
     @torch.no_grad()
     def encode(
@@ -110,15 +90,9 @@ class VGGTGeometryTeacher:
         item_name: str,
         frame_index: int,
     ) -> tuple[torch.Tensor, tuple[int, int]]:
-        cache_path = self._cache_path(
-            item_name,
-            frame_index,
-            (int(image.shape[-2]), int(image.shape[-1])),
-        )
-        if cache_path is not None and cache_path.is_file():
-            payload = torch.load(cache_path, map_location="cpu", weights_only=True)
-            return payload["features"].to(self.device), tuple(payload["grid_hw"])
-
+        # item_name/frame_index remain part of the interface for diagnostics.
+        # Features are deliberately recomputed from RGB every call.
+        del item_name, frame_index
         teacher_image = preprocess_vggt_tensor(image, self.config).to(self.device)
         autocast = (
             torch.autocast("cuda", dtype=self.dtype)
@@ -137,13 +111,5 @@ class VGGTGeometryTeacher:
         if features.shape[1] != grid_hw[0] * grid_hw[1]:
             raise RuntimeError(
                 f"VGGT returned {features.shape[1]} patches for grid {grid_hw}"
-            )
-        if cache_path is not None:
-            torch.save(
-                {
-                    "features": features.cpu().to(torch.float16),
-                    "grid_hw": grid_hw,
-                },
-                cache_path,
             )
         return features, grid_hw

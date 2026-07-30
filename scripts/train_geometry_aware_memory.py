@@ -7,6 +7,7 @@ import json
 import logging
 import math
 import sys
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -38,9 +39,8 @@ from lingbot_video.geometry_aware_memory.teacher import (  # noqa: E402
 )
 from lingbot_video.geometry_aware_memory.training import (  # noqa: E402
     GIMTrainingConfig,
-    SceneLatentCache,
-    gim_training_step,
-    prepare_gim_batch,
+    gim_trajectory_training_step,
+    prepare_gim_trajectory_online,
 )
 from lingbot_video.pipeline_lingbot_video import LingBotVideoPipeline  # noqa: E402
 from lingbot_video.runner import _patch_qwen3vl_from_pretrained  # noqa: E402
@@ -66,37 +66,51 @@ def _config_defaults() -> dict[str, Any]:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Train GIM-World geometry-aware memory on LingBot-Video."
+        description=(
+            "Train GIM-World on independent continuous capture/query "
+            "room-tour trajectories."
+        )
     )
     parser.add_argument("--config", required=True)
-    parser.add_argument("--model_dir", required=False)
+    parser.add_argument("--model_dir", default=None)
     parser.add_argument("--dataset_root", default=None)
-    parser.add_argument(
-        "--latent_cache_root",
-        default=None,
-    )
-    parser.add_argument(
-        "--teacher_cache_root",
-        default=None,
-    )
     parser.add_argument(
         "--output_dir",
         default="outputs/gim_world_geometry_memory",
     )
+    parser.add_argument("--item_list", default=None)
+    parser.add_argument("--resume_from_checkpoint", default=None)
     parser.add_argument("--prompt", default="An indoor room tour.")
+
     parser.add_argument("--height", type=int, default=480)
     parser.add_argument("--width", type=int, default=832)
     parser.add_argument("--target_rgb_frames", type=int, default=81)
+    parser.add_argument("--query_blocks", type=int, default=2)
     parser.add_argument("--vae_temporal_stride", type=int, default=4)
     parser.add_argument("--vae_encode_chunk_rgb_frames", type=int, default=81)
-    parser.add_argument("--min_memory_rgb_frames", type=int, default=800)
-    parser.add_argument("--target_guard_rgb_frames", type=int, default=128)
+    parser.add_argument("--capture_min_rgb_frames", type=int, default=257)
+    parser.add_argument("--capture_max_rgb_frames", type=int, default=801)
     parser.add_argument(
-        "--context_policy",
-        choices=["all_except_target", "prefix"],
-        default="prefix",
+        "--capture_curriculum_start_max_rgb_frames",
+        type=int,
+        default=321,
     )
-    parser.add_argument("--samples_per_item", type=int, default=16)
+    parser.add_argument("--capture_curriculum_epochs", type=int, default=5)
+    parser.add_argument(
+        "--capture_min_fraction_of_current_max",
+        type=float,
+        default=0.75,
+    )
+    parser.add_argument(
+        "--capture_query_guard_rgb_frames",
+        type=int,
+        default=32,
+    )
+    parser.add_argument("--trajectory_candidate_trials", type=int, default=128)
+    parser.add_argument("--trajectory_topk", type=int, default=8)
+    parser.add_argument("--trajectory_pose_stride", type=int, default=4)
+    parser.add_argument("--trajectory_rotation_weight", type=float, default=0.25)
+
     parser.add_argument("--pruning_budget", type=int, default=200)
     parser.add_argument("--memory_latent_frames", type=int, default=20)
     parser.add_argument("--compact_stride", type=int, default=2)
@@ -108,14 +122,30 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--timestep_shift", type=float, default=1.0)
     parser.add_argument("--vggt_model_id", default="facebook/VGGT-1B")
     parser.add_argument(
+        "--predicted_update_probability_start",
+        type=float,
+        default=0.0,
+    )
+    parser.add_argument(
+        "--predicted_update_probability_end",
+        type=float,
+        default=0.5,
+    )
+    parser.add_argument(
+        "--predicted_update_warmup_epochs",
+        type=int,
+        default=5,
+    )
+
+    parser.add_argument(
         "--backbone_train_mode",
         choices=["full", "frozen"],
         default="full",
-        help="The paper setting is full. frozen is an explicit low-memory ablation.",
+        help="full is the paper setting; frozen is a memory-only ablation.",
     )
     parser.add_argument("--learning_rate", type=float, default=1e-5)
     parser.add_argument("--weight_decay", type=float, default=0.0)
-    parser.add_argument("--max_train_steps", type=int, default=8000)
+    parser.add_argument("--num_train_epochs", type=int, default=20)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=32)
     parser.add_argument("--max_grad_norm", type=float, default=1.0)
     parser.add_argument(
@@ -131,29 +161,39 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dataloader_workers", type=int, default=0)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--log_every", type=int, default=10)
-    parser.add_argument("--checkpoint_every", type=int, default=1000)
-    parser.add_argument("--resume_from_checkpoint", default=None)
-    parser.add_argument("--item_list", default=None)
+    parser.add_argument("--checkpoint_every_epochs", type=int, default=1)
+
     parser.set_defaults(**_config_defaults())
     args = parser.parse_args()
-    if not args.model_dir:
-        parser.error("--model_dir is required (it may be supplied by --config)")
-    if not args.dataset_root:
-        parser.error("--dataset_root is required (it may be supplied by --config)")
-    if not args.latent_cache_root:
-        parser.error(
-            "--latent_cache_root is required (it may be supplied by --config)"
-        )
-    if not args.teacher_cache_root:
-        parser.error(
-            "--teacher_cache_root is required (it may be supplied by --config)"
-        )
-    if args.height % 16 or args.width % 16:
-        parser.error("--height and --width must be multiples of 16")
-    if args.pruning_budget < 1:
-        parser.error("--pruning_budget must be positive")
+    for name in ("model_dir", "dataset_root", "output_dir"):
+        if not getattr(args, name):
+            parser.error(f"--{name} is required (it may be supplied by --config)")
+    if args.num_train_epochs < 1:
+        parser.error("--num_train_epochs must be positive")
+    if args.gradient_accumulation_steps < 1:
+        parser.error("--gradient_accumulation_steps must be positive")
+    if args.log_every < 1 or args.checkpoint_every_epochs < 1:
+        parser.error("--log_every and --checkpoint_every_epochs must be positive")
     if args.dataloader_workers < 0:
         parser.error("--dataloader_workers cannot be negative")
+    if args.pruning_budget < 1:
+        parser.error("--pruning_budget must be positive")
+    if args.vae_encode_chunk_rgb_frames < 5:
+        parser.error("--vae_encode_chunk_rgb_frames must be at least 5")
+    if (args.vae_encode_chunk_rgb_frames - 1) % args.vae_temporal_stride:
+        parser.error(
+            "--vae_encode_chunk_rgb_frames must equal "
+            "1 + k * vae_temporal_stride"
+        )
+    for name in (
+        "predicted_update_probability_start",
+        "predicted_update_probability_end",
+    ):
+        value = getattr(args, name)
+        if not 0.0 <= value <= 1.0:
+            parser.error(f"--{name} must be in [0,1]")
+    if args.predicted_update_warmup_epochs < 1:
+        parser.error("--predicted_update_warmup_epochs must be positive")
     return args
 
 
@@ -181,7 +221,7 @@ def _read_item_list(value: str | list[str] | None) -> list[str] | None:
 
 def _first_sample(values: list[RoomTourSample]) -> RoomTourSample:
     if len(values) != 1:
-        raise ValueError("GIM long-memory loader currently requires batch size 1")
+        raise ValueError("one dataloader item must contain exactly one scene")
     return values[0]
 
 
@@ -245,12 +285,22 @@ def _count_parameters(module: torch.nn.Module) -> tuple[int, int]:
     return total, trainable
 
 
+def _checkpoint_file(value: str) -> Path:
+    path = Path(value)
+    if path.is_dir():
+        path = path / "trainable_components.pt"
+    if not path.is_file():
+        raise FileNotFoundError(path)
+    return path
+
+
 def _checkpoint_payload(
     model: GIMWorldLingBotModel,
     optimizer: torch.optim.Optimizer,
     *,
     args: argparse.Namespace,
     step: int,
+    next_epoch: int,
 ) -> dict[str, Any]:
     trainable_names = {
         name
@@ -261,19 +311,40 @@ def _checkpoint_payload(
         name: tensor.detach().cpu()
         for name, tensor in model.state_dict().items()
         if name in trainable_names
-        or any(name.startswith(f"{prefix}.") for prefix in (
-            "memory_encoder",
-            "geometry_head",
-            "action_encoder",
-        ))
+        or any(
+            name.startswith(f"{prefix}.")
+            for prefix in (
+                "memory_encoder",
+                "geometry_head",
+                "action_encoder",
+            )
+        )
     }
     return {
         "model": state,
         "global_step": int(step),
+        "next_epoch": int(next_epoch),
         "model_config": model.gim_config.to_dict(),
         "training_config": vars(args),
         "optimizer": optimizer.state_dict(),
     }
+
+
+def _scheduled_probability(args: argparse.Namespace, epoch: int) -> float:
+    if args.predicted_update_warmup_epochs <= 1:
+        return float(args.predicted_update_probability_end)
+    progress = min(
+        max(epoch, 0) / (args.predicted_update_warmup_epochs - 1),
+        1.0,
+    )
+    return float(
+        args.predicted_update_probability_start
+        + progress
+        * (
+            args.predicted_update_probability_end
+            - args.predicted_update_probability_start
+        )
+    )
 
 
 def main() -> None:
@@ -297,11 +368,22 @@ def main() -> None:
         height=args.height,
         width=args.width,
         target_rgb_frames=args.target_rgb_frames,
+        query_blocks=args.query_blocks,
         vae_temporal_stride=args.vae_temporal_stride,
-        min_memory_rgb_frames=args.min_memory_rgb_frames,
-        target_guard_rgb_frames=args.target_guard_rgb_frames,
-        samples_per_item=args.samples_per_item,
-        context_policy=args.context_policy,
+        capture_min_rgb_frames=args.capture_min_rgb_frames,
+        capture_max_rgb_frames=args.capture_max_rgb_frames,
+        capture_curriculum_start_max_rgb_frames=(
+            args.capture_curriculum_start_max_rgb_frames
+        ),
+        capture_curriculum_epochs=args.capture_curriculum_epochs,
+        capture_min_fraction_of_current_max=(
+            args.capture_min_fraction_of_current_max
+        ),
+        capture_query_guard_rgb_frames=args.capture_query_guard_rgb_frames,
+        trajectory_candidate_trials=args.trajectory_candidate_trials,
+        trajectory_topk=args.trajectory_topk,
+        trajectory_pose_stride=args.trajectory_pose_stride,
+        trajectory_rotation_weight=args.trajectory_rotation_weight,
     )
     sample_config.validate()
     dataset = LocalVipeRoomTourDataset(
@@ -309,24 +391,25 @@ def main() -> None:
         sample_config,
         item_list=_read_item_list(args.item_list),
         seed=args.seed,
-        rank=accelerator.process_index,
-        world_size=accelerator.num_processes,
     )
+    loader_generator = torch.Generator().manual_seed(args.seed)
     dataloader = DataLoader(
         dataset,
         batch_size=1,
+        shuffle=True,
         num_workers=args.dataloader_workers,
         collate_fn=_first_sample,
         pin_memory=False,
+        generator=loader_generator,
+        # Workers are recreated each epoch so they see dataset.set_epoch().
+        persistent_workers=False,
     )
+
     backbone, vae, prompt_embeds, prompt_mask = _load_base(
         args,
         accelerator.device,
     )
-    if args.backbone_train_mode == "frozen":
-        backbone.requires_grad_(False)
-    else:
-        backbone.requires_grad_(True)
+    backbone.requires_grad_(args.backbone_train_mode == "full")
     teacher_hw = vggt_target_hw((args.height, args.width))
     model = GIMWorldLingBotModel(
         backbone,
@@ -342,7 +425,6 @@ def main() -> None:
     if args.gradient_checkpointing:
         model.backbone.enable_gradient_checkpointing()
         model.memory_encoder.gradient_checkpointing = True
-
     optimizer = torch.optim.AdamW(
         [
             parameter
@@ -353,28 +435,22 @@ def main() -> None:
         weight_decay=args.weight_decay,
         betas=(0.9, 0.999),
     )
-    # The iterable dataset already shards local items by process/worker.  Do
-    # not wrap it in Accelerate's IterableDatasetShard a second time.
-    model, optimizer = accelerator.prepare(
+    model, optimizer, dataloader = accelerator.prepare(
         model,
         optimizer,
+        dataloader,
     )
     prompt_embeds = prompt_embeds.to(accelerator.device)
     prompt_mask = prompt_mask.to(accelerator.device)
+
+    # No cache object exists in this loop. VGGT is frozen but executes from
+    # the sampled target RGB on every query block of every scene iteration.
     teacher = VGGTGeometryTeacher(
         VGGTTeacherConfig(
             model_id=args.vggt_model_id,
-            cache_dir=args.teacher_cache_root,
         ),
         device=accelerator.device,
         dtype=_dtype(args.mixed_precision),
-    )
-    latent_cache = SceneLatentCache(
-        args.latent_cache_root,
-        height=args.height,
-        width=args.width,
-        temporal_stride=args.vae_temporal_stride,
-        chunk_rgb_frames=args.vae_encode_chunk_rgb_frames,
     )
     pruner = MIGreedyPruner(
         PoseTimeKernelConfig(
@@ -384,48 +460,57 @@ def main() -> None:
             jitter=args.kernel_jitter,
         )
     )
-    training_config = GIMTrainingConfig(
+    base_training_config = GIMTrainingConfig(
         pruning_budget=args.pruning_budget,
         geometry_loss_weight=args.geometry_loss_weight,
         vae_temporal_stride=args.vae_temporal_stride,
         vae_encode_chunk_rgb_frames=args.vae_encode_chunk_rgb_frames,
         timestep_shift=args.timestep_shift,
     )
+
     unwrapped = accelerator.unwrap_model(model)
     total_parameters, trainable_parameters = _count_parameters(unwrapped)
-    memory_parameters = sum(
-        parameter.numel()
-        for parameter in unwrapped.memory_encoder.parameters()
-    )
-    geometry_parameters = sum(
-        parameter.numel()
-        for parameter in unwrapped.geometry_head.parameters()
-    )
-    action_parameters = sum(
-        parameter.numel()
-        for parameter in unwrapped.action_encoder.parameters()
-    )
-    backbone_total, backbone_trainable = _count_parameters(
-        unwrapped.backbone
-    )
+    backbone_total, backbone_trainable = _count_parameters(unwrapped.backbone)
     patch_height, patch_width = unwrapped.patch_grid
     compact_height = patch_height // args.compact_stride
     compact_width = patch_width // args.compact_stride
     run_summary = {
         "dataset_root": args.dataset_root,
         "data_access": "direct_local_filesystem",
-        "dataset_items": len(dataset.items),
-        "samples_per_item_reuse": args.samples_per_item,
-        "training_samples_per_dataset_pass": (
-            len(dataset.items) * args.samples_per_item
-        ),
+        "dataset_items": len(dataset),
+        "scene_iterations_per_epoch": len(dataset),
+        "scene_sampling": "one_random_trajectory_pair_per_scene_per_epoch",
         "resolution": [args.height, args.width],
-        "target_rgb_frames": args.target_rgb_frames,
-        "target_latent_frames": sample_config.target_latent_frames,
-        "context_policy": args.context_policy,
-        "target_guard_rgb_frames": args.target_guard_rgb_frames,
-        "vae_cache_mode": "wan_official_feature_cache_v1",
+        "capture_rgb_frames": [
+            args.capture_min_rgb_frames,
+            args.capture_max_rgb_frames,
+        ],
+        "capture_curriculum_start_max": (
+            args.capture_curriculum_start_max_rgb_frames
+        ),
+        "capture_curriculum_epochs": args.capture_curriculum_epochs,
+        "capture_min_fraction_of_current_max": (
+            args.capture_min_fraction_of_current_max
+        ),
+        "query_blocks": args.query_blocks,
+        "query_rgb_frames_per_block": args.target_rgb_frames,
+        "query_rgb_frames_total": sample_config.query_rgb_frames,
+        "query_latent_frames_per_block": sample_config.target_latent_frames,
+        "capture_query_guard_rgb_frames": (
+            args.capture_query_guard_rgb_frames
+        ),
+        "trajectory_candidate_trials": args.trajectory_candidate_trials,
+        "vae_execution": "online_from_rgb_every_scene_iteration",
+        "vggt_execution": "online_from_rgb_every_query_block",
+        "persistent_feature_cache": False,
         "vae_read_chunk_rgb_frames": args.vae_encode_chunk_rgb_frames,
+        "dynamic_memory_update": (
+            "teacher_forced_or_detached_predicted_x0_then_reencode_memory"
+        ),
+        "predicted_update_probability": [
+            args.predicted_update_probability_start,
+            args.predicted_update_probability_end,
+        ],
         "pruning_budget": args.pruning_budget,
         "memory_latent_frames": args.memory_latent_frames,
         "memory_patch_grid": [patch_height, patch_width],
@@ -442,25 +527,30 @@ def main() -> None:
         "backbone_train_mode": args.backbone_train_mode,
         "total_parameters": total_parameters,
         "trainable_parameters": trainable_parameters,
-        "memory_encoder_parameters": memory_parameters,
-        "geometry_head_parameters": geometry_parameters,
-        "action_encoder_parameters": action_parameters,
+        "memory_encoder_parameters": sum(
+            p.numel() for p in unwrapped.memory_encoder.parameters()
+        ),
+        "geometry_head_parameters": sum(
+            p.numel() for p in unwrapped.geometry_head.parameters()
+        ),
+        "action_encoder_parameters": sum(
+            p.numel() for p in unwrapped.action_encoder.parameters()
+        ),
         "backbone_parameters": backbone_total,
         "backbone_trainable_parameters": backbone_trainable,
         "world_size": accelerator.num_processes,
         "gradient_accumulation_steps": args.gradient_accumulation_steps,
-        "effective_batch_size": (
+        "effective_scene_batch_size": (
             accelerator.num_processes * args.gradient_accumulation_steps
         ),
         "learning_rate": args.learning_rate,
-        "max_train_steps": args.max_train_steps,
+        "num_train_epochs": args.num_train_epochs,
     }
     if accelerator.is_main_process:
-        logger.info("GIM-WORLD TRAINING CONFIG\n%s", json.dumps(
-            run_summary,
-            indent=2,
-            ensure_ascii=False,
-        ))
+        logger.info(
+            "GIM-WORLD TRAINING CONFIG\n%s",
+            json.dumps(run_summary, indent=2, ensure_ascii=False),
+        )
         (output_dir / "resolved_training_config.json").write_text(
             json.dumps(
                 {**vars(args), **run_summary},
@@ -470,6 +560,12 @@ def main() -> None:
             + "\n",
             encoding="utf-8",
         )
+        if accelerator.num_processes > 1:
+            logger.warning(
+                "Distributed dataloader may pad at most world_size-1 scenes "
+                "when the dataset size is not divisible by world size. "
+                "Single-GPU training visits every scene exactly once/epoch."
+            )
     accelerator.init_trackers(
         "gim_world_geometry_memory",
         config={
@@ -480,9 +576,10 @@ def main() -> None:
     )
 
     global_step = 0
+    start_epoch = 0
     if args.resume_from_checkpoint:
         checkpoint = torch.load(
-            args.resume_from_checkpoint,
+            _checkpoint_file(args.resume_from_checkpoint),
             map_location="cpu",
             weights_only=False,
         )
@@ -491,89 +588,162 @@ def main() -> None:
             strict=False,
         )
         global_step = int(checkpoint.get("global_step", 0))
+        start_epoch = int(checkpoint.get("next_epoch", 0))
         if "optimizer" in checkpoint:
             optimizer.load_state_dict(checkpoint["optimizer"])
         logger.info(
-            "resumed components at step=%d missing=%d unexpected=%d",
+            "resumed epoch=%d step=%d missing=%d unexpected=%d",
+            start_epoch,
             global_step,
             len(missing),
             len(unexpected),
         )
 
     model.train()
-    for sample in dataloader:
-        if global_step >= args.max_train_steps:
-            break
-        prepared = prepare_gim_batch(
-            sample,
-            vae=vae,
-            latent_cache=latent_cache,
-            pruner=pruner,
-            pruning_budget=args.pruning_budget,
-            vae_temporal_stride=args.vae_temporal_stride,
-            device=accelerator.device,
-            compute_dtype=_dtype(args.mixed_precision),
+    for epoch in range(start_epoch, args.num_train_epochs):
+        dataset.set_epoch(epoch)
+        update_probability = _scheduled_probability(args, epoch)
+        training_config = replace(
+            base_training_config,
+            predicted_update_probability=update_probability,
         )
-        with accelerator.accumulate(model):
-            output = gim_training_step(
-                model,
-                prepared,
-                teacher=teacher,
-                prompt_embeds=prompt_embeds,
-                prompt_mask=prompt_mask,
-                config=training_config,
-                item_name=sample.item_name,
-                geometry_query_index=sample.geometry_query_index,
-            )
-            accelerator.backward(output["loss"])
-            if accelerator.sync_gradients:
-                accelerator.clip_grad_norm_(
-                    model.parameters(),
-                    args.max_grad_norm,
-                )
-            optimizer.step()
-            optimizer.zero_grad(set_to_none=True)
-        if not accelerator.sync_gradients:
-            continue
-        global_step += 1
-        metrics = {
-            f"train/{key}": float(value.detach().float().item())
-            for key, value in output.items()
-        }
-        metrics["train/learning_rate"] = float(
-            optimizer.param_groups[0]["lr"]
-        )
-        accelerator.log(metrics, step=global_step)
-        if global_step % args.log_every == 0 and accelerator.is_main_process:
+        if accelerator.is_main_process:
             logger.info(
-                "step=%d item=%s target_start=%d %s",
-                global_step,
-                sample.item_name,
-                sample.target_start,
-                " ".join(
-                    f"{key}={value:.6g}"
-                    for key, value in metrics.items()
-                ),
+                "epoch=%d/%d scenes=%d capture_rgb_bounds=%s "
+                "predicted_update_probability=%.3f",
+                epoch + 1,
+                args.num_train_epochs,
+                len(dataset),
+                sample_config.capture_bounds_for_epoch(epoch),
+                update_probability,
             )
-        if (
-            global_step % args.checkpoint_every == 0
-            or global_step == args.max_train_steps
-        ):
-            accelerator.wait_for_everyone()
-            if accelerator.is_main_process:
-                checkpoint_dir = output_dir / f"checkpoint-{global_step:08d}"
-                checkpoint_dir.mkdir(parents=True, exist_ok=True)
-                payload = _checkpoint_payload(
-                    accelerator.unwrap_model(model),
-                    optimizer,
-                    args=args,
-                    step=global_step,
+
+        for scene_step, sample in enumerate(dataloader):
+            # Both capture and every target block are freshly read and encoded.
+            # The online VAE work intentionally happens once per scene sample.
+            prepared = prepare_gim_trajectory_online(
+                sample,
+                vae=vae,
+                vae_temporal_stride=args.vae_temporal_stride,
+                vae_encode_chunk_rgb_frames=(
+                    args.vae_encode_chunk_rgb_frames
+                ),
+                device=accelerator.device,
+                compute_dtype=_dtype(args.mixed_precision),
+            )
+            accumulation_offset = (
+                scene_step % args.gradient_accumulation_steps
+            )
+            accumulation_start = scene_step - accumulation_offset
+            accumulation_group_size = min(
+                args.gradient_accumulation_steps,
+                len(dataloader) - accumulation_start,
+            )
+            # Accelerator always divides backward losses by the configured
+            # accumulation count. Rescale the final partial group so every
+            # scene retains equal weight instead of being divided by 32.
+            partial_group_rescale = (
+                args.gradient_accumulation_steps
+                / accumulation_group_size
+            )
+
+            def backward_scene(loss: torch.Tensor) -> None:
+                accelerator.backward(loss * partial_group_rescale)
+
+            with accelerator.accumulate(model):
+                output = gim_trajectory_training_step(
+                    model,
+                    prepared,
+                    teacher=teacher,
+                    pruner=pruner,
+                    prompt_embeds=prompt_embeds,
+                    prompt_mask=prompt_mask,
+                    config=training_config,
+                    device=accelerator.device,
+                    compute_dtype=_dtype(args.mixed_precision),
+                    backward=backward_scene,
                 )
-                accelerator.save(
-                    payload,
-                    checkpoint_dir / "trainable_components.pt",
+                if accelerator.sync_gradients:
+                    accelerator.clip_grad_norm_(
+                        model.parameters(),
+                        args.max_grad_norm,
+                    )
+                optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
+
+            if not accelerator.sync_gradients:
+                continue
+            global_step += 1
+            metrics = {
+                f"train/{key}": float(value.detach().float().item())
+                for key, value in output.items()
+            }
+            metrics.update(
+                {
+                    "train/learning_rate": float(
+                        optimizer.param_groups[0]["lr"]
+                    ),
+                    "train/epoch": float(epoch),
+                    "train/capture_rgb_frames": float(
+                        len(sample.capture_rgb_indices)
+                    ),
+                    "train/predicted_update_probability": (
+                        update_probability
+                    ),
+                }
+            )
+            accelerator.log(metrics, step=global_step)
+            if global_step % args.log_every == 0 and accelerator.is_main_process:
+                logger.info(
+                    "step=%d epoch=%d scene=%d/%d item=%s "
+                    "capture=%d:%d query=%d:%d score=%.4f %s",
+                    global_step,
+                    epoch + 1,
+                    scene_step + 1,
+                    len(dataloader),
+                    sample.item_name,
+                    sample.capture_start,
+                    sample.capture_rgb_indices[-1],
+                    sample.query_start,
+                    sample.query_rgb_blocks[-1][-1],
+                    sample.trajectory_overlap_score,
+                    " ".join(
+                        f"{key}={value:.6g}"
+                        for key, value in metrics.items()
+                        if key
+                        in {
+                            "train/loss",
+                            "train/flow_loss",
+                            "train/geometry_loss",
+                            "train/history_retained",
+                            "train/predicted_update_fraction",
+                        }
+                    ),
                 )
-                logger.info("saved %s", checkpoint_dir)
+
+        accelerator.wait_for_everyone()
+        should_save = (
+            (epoch + 1) % args.checkpoint_every_epochs == 0
+            or epoch + 1 == args.num_train_epochs
+        )
+        if should_save and accelerator.is_main_process:
+            checkpoint_dir = (
+                output_dir
+                / f"checkpoint-epoch-{epoch + 1:04d}-step-{global_step:08d}"
+            )
+            checkpoint_dir.mkdir(parents=True, exist_ok=True)
+            payload = _checkpoint_payload(
+                accelerator.unwrap_model(model),
+                optimizer,
+                args=args,
+                step=global_step,
+                next_epoch=epoch + 1,
+            )
+            accelerator.save(
+                payload,
+                checkpoint_dir / "trainable_components.pt",
+            )
+            logger.info("saved %s", checkpoint_dir)
 
     accelerator.end_training()
 

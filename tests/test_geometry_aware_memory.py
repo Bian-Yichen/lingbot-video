@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import random
+from pathlib import Path
+
+import numpy as np
 import pytest
 import torch
 
@@ -7,6 +11,7 @@ import lingbot_video.transformer_lingbot_video as lingbot_transformer
 from lingbot_video.geometry_aware_memory.data import (
     GeometryMemorySampleConfig,
     LocalRoomTourIndex,
+    VipeRoomTourItem,
 )
 from lingbot_video.geometry_aware_memory.memory_encoder import (
     GIMImplicitMemoryEncoder,
@@ -38,12 +43,66 @@ def test_local_roomtour_index_uses_mounted_scene_in_place(tmp_path) -> None:
         index.item_path("../scene_000.mp4")
 
 
-def test_offline_context_rejects_target_leaking_guard() -> None:
-    with pytest.raises(ValueError, match="target_guard_rgb_frames >= 128"):
+def test_trajectory_lengths_must_match_causal_vae_stride() -> None:
+    with pytest.raises(ValueError, match="target_rgb_frames"):
         GeometryMemorySampleConfig(
-            context_policy="all_except_target",
-            target_guard_rgb_frames=0,
+            target_rgb_frames=80,
         ).validate()
+    with pytest.raises(ValueError, match="capture_min_rgb_frames"):
+        GeometryMemorySampleConfig(
+            capture_min_rgb_frames=256,
+        ).validate()
+
+
+def test_capture_curriculum_reaches_full_length() -> None:
+    config = GeometryMemorySampleConfig(
+        capture_min_rgb_frames=257,
+        capture_curriculum_start_max_rgb_frames=321,
+        capture_max_rgb_frames=801,
+        capture_curriculum_epochs=5,
+    )
+    assert config.capture_max_for_epoch(0) == 321
+    assert config.capture_max_for_epoch(2) == 561
+    assert config.capture_max_for_epoch(4) == 801
+    assert config.capture_max_for_epoch(99) == 801
+    assert config.capture_bounds_for_epoch(0) == (257, 321)
+    assert config.capture_bounds_for_epoch(2) == (421, 561)
+    assert config.capture_bounds_for_epoch(4) == (601, 801)
+
+
+def test_sample_is_continuous_disjoint_capture_and_query() -> None:
+    item = VipeRoomTourItem.__new__(VipeRoomTourItem)
+    item.root = Path("/fake/scene.mp4")
+    item.indices = list(range(1000))
+    item.pose_by_index = {}
+    for index in item.indices:
+        pose = np.eye(4, dtype=np.float32)
+        pose[0, 3] = np.sin(index / 80.0)
+        pose[1, 3] = np.cos(index / 80.0)
+        pose[2, 3] = index / 1000.0
+        item.pose_by_index[index] = pose
+    config = GeometryMemorySampleConfig(
+        query_blocks=2,
+        capture_min_rgb_frames=257,
+        capture_curriculum_start_max_rgb_frames=321,
+        capture_max_rgb_frames=321,
+        capture_curriculum_epochs=0,
+        capture_query_guard_rgb_frames=32,
+        trajectory_candidate_trials=16,
+        trajectory_topk=4,
+    )
+    sample = item.make_sample(config, random.Random(7))
+    capture = sample.capture_rgb_indices
+    query = tuple(
+        index for block in sample.query_rgb_blocks for index in block
+    )
+    assert capture == tuple(range(capture[0], capture[-1] + 1))
+    assert query == tuple(range(query[0], query[-1] + 1))
+    assert set(capture).isdisjoint(query)
+    gap = max(query[0] - capture[-1] - 1, capture[0] - query[-1] - 1)
+    assert gap >= config.capture_query_guard_rgb_frames
+    assert len(sample.query_rgb_blocks) == 2
+    assert all(len(block) == 81 for block in sample.query_rgb_blocks)
 
 
 def test_ray_at_principal_point_is_camera_forward() -> None:

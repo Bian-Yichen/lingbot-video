@@ -22,20 +22,19 @@ from lingbot_video.geometry_aware_memory.data import (  # noqa: E402
     LocalRoomTourIndex,
     VipeRoomTourItem,
 )
+from lingbot_video.geometry_aware_memory.inference import (  # noqa: E402
+    DynamicGIMHistory,
+)
 from lingbot_video.geometry_aware_memory.model import (  # noqa: E402
     GIMWorldLingBotModel,
     GIMWorldModelConfig,
-)
-from lingbot_video.geometry_aware_memory.inference import (  # noqa: E402
-    DynamicGIMHistory,
 )
 from lingbot_video.geometry_aware_memory.pruning import (  # noqa: E402
     MIGreedyPruner,
     PoseTimeKernelConfig,
 )
 from lingbot_video.geometry_aware_memory.training import (  # noqa: E402
-    SceneLatentCache,
-    prepare_gim_batch,
+    encode_wan_scene_streaming,
 )
 from lingbot_video.pipeline_lingbot_video import (  # noqa: E402
     DEFAULT_NEGATIVE_PROMPT,
@@ -64,27 +63,29 @@ def _config_defaults() -> dict[str, Any]:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Evaluate a GIM-World LingBot checkpoint on one withheld room-tour block."
+        description=(
+            "Roll out an independent query-camera trajectory from one long "
+            "continuous capture trajectory."
+        )
     )
     parser.add_argument("--config", required=True)
     parser.add_argument("--checkpoint", default=None)
     parser.add_argument("--model_dir", default=None)
-    parser.add_argument("--item_name", default=None)
-    parser.add_argument("--target_start", type=int, default=None)
     parser.add_argument("--dataset_root", default=None)
-    parser.add_argument("--latent_cache_root", default=None)
+    parser.add_argument("--item_name", default=None)
     parser.add_argument("--output_dir", default=None)
+    parser.add_argument("--capture_start", type=int, default=None)
+    parser.add_argument("--query_start", type=int, default=None)
+    parser.add_argument("--capture_rgb_frames", type=int, default=None)
+    parser.add_argument("--sample_epoch", type=int, default=None)
     parser.add_argument("--prompt", default=None)
     parser.add_argument("--negative_prompt", default=DEFAULT_NEGATIVE_PROMPT)
     parser.add_argument("--num_inference_steps", type=int, default=40)
     parser.add_argument(
         "--num_blocks",
         type=int,
-        default=1,
-        help=(
-            "Number of consecutive 81-RGB blocks to roll out. Each generated "
-            "block is appended to history before rebuilding memory."
-        ),
+        default=2,
+        help="Each block generates one target_rgb_frames clip and writes it back.",
     )
     parser.add_argument("--guidance_scale", type=float, default=6.0)
     parser.add_argument("--flow_shift", type=float, default=3.0)
@@ -97,29 +98,30 @@ def parse_args() -> argparse.Namespace:
     )
     parser.set_defaults(**_config_defaults())
     args = parser.parse_args()
-    for name in (
-        "checkpoint",
-        "item_name",
-        "dataset_root",
-        "latent_cache_root",
-        "output_dir",
-    ):
+    for name in ("checkpoint", "item_name", "dataset_root", "output_dir"):
         if not getattr(args, name):
             parser.error(f"--{name} is required (it may be supplied by --config)")
-    if args.negative_prompt is None:
-        args.negative_prompt = DEFAULT_NEGATIVE_PROMPT
     if args.num_blocks < 1:
         parser.error("--num_blocks must be positive")
+    if (args.capture_start is None) != (args.query_start is None):
+        parser.error("--capture_start and --query_start must be set together")
+    if args.capture_rgb_frames is not None and args.capture_start is None:
+        parser.error(
+            "--capture_rgb_frames requires explicit --capture_start and "
+            "--query_start"
+        )
+    if args.negative_prompt is None:
+        args.negative_prompt = DEFAULT_NEGATIVE_PROMPT
     return args
 
 
-def _checkpoint_file(path: str) -> Path:
-    candidate = Path(path)
-    if candidate.is_dir():
-        candidate = candidate / "trainable_components.pt"
-    if not candidate.is_file():
-        raise FileNotFoundError(candidate)
-    return candidate
+def _checkpoint_file(value: str) -> Path:
+    path = Path(value)
+    if path.is_dir():
+        path = path / "trainable_components.pt"
+    if not path.is_file():
+        raise FileNotFoundError(path)
+    return path
 
 
 def _dtype(name: str) -> torch.dtype:
@@ -154,7 +156,7 @@ def main() -> None:
     model_dir = args.model_dir or training_config.get("model_dir")
     if not model_dir:
         raise ValueError(
-            "--model_dir is required because the checkpoint has no model_dir metadata"
+            "--model_dir is required because checkpoint metadata has no model_dir"
         )
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     compute_dtype = _dtype(args.mixed_precision)
@@ -181,6 +183,7 @@ def main() -> None:
             },
         )
     pipe.to(device)
+    pipe.vae.requires_grad_(False).eval()
     model_config = GIMWorldModelConfig(**checkpoint["model_config"])
     model = GIMWorldLingBotModel(pipe.transformer, model_config)
     missing, unexpected = model.load_state_dict(
@@ -197,95 +200,118 @@ def main() -> None:
             len(missing),
             len(unexpected),
         )
-    # GIM-World explicitly discards the training-only geometry decoder.
+    # VGGT and the geometry decoder are training-only in GIM-World.
     del model.geometry_head
     model.eval().to(device)
 
     item_path = LocalRoomTourIndex(args.dataset_root).item_path(args.item_name)
-    logger.info("opening mounted scene directly: %s", item_path)
     item = VipeRoomTourItem(item_path)
     sample_config = GeometryMemorySampleConfig(
         height=model_config.image_height,
         width=model_config.image_width,
-        target_rgb_frames=int(training_config.get("target_rgb_frames", 81)),
+        target_rgb_frames=int(
+            training_config.get("target_rgb_frames", 81)
+        ),
+        query_blocks=args.num_blocks,
         vae_temporal_stride=int(
             training_config.get("vae_temporal_stride", 4)
         ),
-        min_memory_rgb_frames=int(
-            training_config.get("min_memory_rgb_frames", 800)
+        capture_min_rgb_frames=int(
+            training_config.get("capture_min_rgb_frames", 257)
         ),
-        target_guard_rgb_frames=int(
-            training_config.get("target_guard_rgb_frames", 128)
+        capture_max_rgb_frames=int(
+            training_config.get("capture_max_rgb_frames", 801)
         ),
-        samples_per_item=1,
-        context_policy=str(
-            training_config.get("context_policy", "prefix")
+        capture_curriculum_start_max_rgb_frames=int(
+            training_config.get(
+                "capture_curriculum_start_max_rgb_frames",
+                321,
+            )
+        ),
+        capture_curriculum_epochs=int(
+            training_config.get("capture_curriculum_epochs", 5)
+        ),
+        capture_min_fraction_of_current_max=float(
+            training_config.get(
+                "capture_min_fraction_of_current_max",
+                0.75,
+            )
+        ),
+        capture_query_guard_rgb_frames=int(
+            training_config.get("capture_query_guard_rgb_frames", 32)
+        ),
+        trajectory_candidate_trials=int(
+            training_config.get("trajectory_candidate_trials", 128)
+        ),
+        trajectory_topk=int(
+            training_config.get("trajectory_topk", 8)
+        ),
+        trajectory_pose_stride=int(
+            training_config.get("trajectory_pose_stride", 4)
+        ),
+        trajectory_rotation_weight=float(
+            training_config.get("trajectory_rotation_weight", 0.25)
         ),
     )
-    if sample_config.context_policy != "prefix" and args.num_blocks > 1:
-        raise ValueError(
-            "multi-block rollout requires context_policy=prefix; an offline "
-            "all_except_target context would contain future ground-truth frames"
-        )
-    valid_starts = [
-        start
-        for start in item.valid_target_starts(sample_config)
-        if (
-            start
-            + args.num_blocks * sample_config.target_rgb_frames
-            - 1
-            <= item.indices[-1]
-        )
-    ]
-    if not valid_starts:
-        raise RuntimeError(
-            f"{item.root.name} has no target start for {args.num_blocks} "
-            "consecutive blocks"
-        )
-    target_start = (
-        random.Random(args.seed).choice(valid_starts)
-        if args.target_start is None
-        else args.target_start
+    sample_epoch = (
+        max(sample_config.capture_curriculum_epochs - 1, 0)
+        if args.sample_epoch is None
+        else args.sample_epoch
     )
-    if target_start not in valid_starts:
-        raise ValueError(
-            f"target_start={target_start} cannot support {args.num_blocks} "
-            f"blocks; examples of valid starts: {valid_starts[:8]}"
-        )
     sample = item.make_sample(
         sample_config,
         random.Random(args.seed),
-        target_start=target_start,
+        epoch=sample_epoch,
+        capture_start=args.capture_start,
+        query_start=args.query_start,
+        capture_rgb_frames=args.capture_rgb_frames,
     )
-    pruner = MIGreedyPruner(
-        PoseTimeKernelConfig(
-            sigma_position=float(training_config.get("sigma_position", -1.0)),
-            sigma_rotation=float(
-                training_config.get("sigma_rotation", np.pi / 6)
-            ),
-            sigma_time=float(training_config.get("sigma_time", 50.0)),
-            jitter=float(training_config.get("kernel_jitter", 1e-5)),
-        )
+    logger.info(
+        "scene=%s capture=%d:%d (%d RGB) query=%d:%d (%d blocks) "
+        "coverage_score=%.4f",
+        args.item_name,
+        sample.capture_start,
+        sample.capture_rgb_indices[-1],
+        len(sample.capture_rgb_indices),
+        sample.query_start,
+        sample.query_rgb_blocks[-1][-1],
+        args.num_blocks,
+        sample.trajectory_overlap_score,
     )
-    latent_cache = SceneLatentCache(
-        args.latent_cache_root,
-        height=model_config.image_height,
-        width=model_config.image_width,
+
+    # Inference input contains capture RGB only. Query RGB is never encoded;
+    # it is read after generation solely for evaluation videos.
+    capture_latents = encode_wan_scene_streaming(
+        pipe.vae,
+        item,
+        sample.capture_rgb_indices,
+        sample.image_hw,
         temporal_stride=sample_config.vae_temporal_stride,
-        chunk_rgb_frames=int(
+        read_chunk_rgb_frames=int(
             training_config.get("vae_encode_chunk_rgb_frames", 81)
         ),
-    )
-    prepared = prepare_gim_batch(
-        sample,
-        vae=pipe.vae,
-        latent_cache=latent_cache,
-        pruner=pruner,
-        pruning_budget=int(training_config.get("pruning_budget", 200)),
-        vae_temporal_stride=sample_config.vae_temporal_stride,
         device=device,
-        compute_dtype=compute_dtype,
+        dtype=compute_dtype,
     )
+    capture_latent_indices = sample.capture_rgb_indices[
+        :: sample_config.vae_temporal_stride
+    ]
+    capture_c2w, capture_intrinsics = item.cameras(
+        capture_latent_indices,
+        sample.image_hw,
+        origin_index=sample.capture_start,
+    )
+    capture_times = (
+        torch.arange(len(capture_latent_indices), dtype=torch.long)
+        * sample_config.vae_temporal_stride
+    )
+    history_state = DynamicGIMHistory(
+        latents=capture_latents,
+        c2w=capture_c2w.unsqueeze(0),
+        intrinsics=capture_intrinsics.unsqueeze(0),
+        times=capture_times,
+    )
+
     prompt = args.prompt or training_config.get(
         "prompt",
         "An indoor room tour.",
@@ -297,44 +323,50 @@ def main() -> None:
             args.negative_prompt,
             device=device,
         )
-
-    generator = torch.Generator(device=device).manual_seed(args.seed)
-    history_state = DynamicGIMHistory(
-        latents=prepared["all_history_latents"],
-        c2w=prepared["all_history_c2w"],
-        intrinsics=prepared["all_history_intrinsics"],
-        times=prepared["all_history_times"],
+    pruner = MIGreedyPruner(
+        PoseTimeKernelConfig(
+            sigma_position=float(
+                training_config.get("sigma_position", -1.0)
+            ),
+            sigma_rotation=float(
+                training_config.get("sigma_rotation", np.pi / 6)
+            ),
+            sigma_time=float(training_config.get("sigma_time", 50.0)),
+            jitter=float(training_config.get("kernel_jitter", 1e-5)),
+        )
     )
+
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    generator = torch.Generator(device=device).manual_seed(args.seed)
     generated_blocks: list[np.ndarray] = []
     ground_truth_blocks: list[np.ndarray] = []
-    block_metadata: list[dict] = []
-    latent_shape = tuple(prepared["target_latents"].shape)
+    block_metadata: list[dict[str, Any]] = []
+    latent_shape = (
+        1,
+        capture_latents.shape[1],
+        sample_config.target_latent_frames,
+        capture_latents.shape[3],
+        capture_latents.shape[4],
+    )
     pruning_budget = int(training_config.get("pruning_budget", 200))
     autocast = (
         torch.autocast("cuda", dtype=compute_dtype)
         if device.type == "cuda"
         else contextlib.nullcontext()
     )
+
     with torch.no_grad():
-        for block_index in range(args.num_blocks):
-            block_start = (
-                sample.target_start
-                + block_index * sample_config.target_rgb_frames
-            )
-            block_rgb_indices = tuple(
-                range(
-                    block_start,
-                    block_start + sample_config.target_rgb_frames,
-                )
-            )
+        for block_index, block_rgb_indices in enumerate(
+            sample.query_rgb_blocks
+        ):
             block_latent_indices = block_rgb_indices[
                 :: sample_config.vae_temporal_stride
             ]
             target_c2w, target_intrinsics = item.cameras(
                 block_latent_indices,
                 sample.image_hw,
+                origin_index=sample.capture_start,
             )
             target_c2w = target_c2w.unsqueeze(0).to(device)
             target_intrinsics = target_intrinsics.unsqueeze(0).to(device)
@@ -351,6 +383,7 @@ def main() -> None:
                     target_c2w,
                     target_intrinsics,
                 )
+
             latents = torch.randn(
                 latent_shape,
                 generator=generator,
@@ -396,17 +429,25 @@ def main() -> None:
                 )[0]
 
             retained_times = history_state.times[retained_positions].tolist()
+            next_time = (
+                int(history_state.times.max().item())
+                + sample_config.vae_temporal_stride
+            )
+            update_times = (
+                torch.arange(
+                    latents.shape[2],
+                    dtype=history_state.times.dtype,
+                )
+                * sample_config.vae_temporal_stride
+                + next_time
+            )
             history_state.append(
-                latents.detach().cpu().to(
-                    prepared["all_history_latents"].dtype
-                ),
+                latents.detach().cpu().to(capture_latents.dtype),
                 target_c2w.cpu(),
                 target_intrinsics.cpu(),
-                torch.tensor(
-                    block_latent_indices,
-                    dtype=history_state.times.dtype,
-                ),
+                update_times,
             )
+
             generated = pipe._decode_latents(latents)[0]
             ground_truth = (
                 item.read_video(block_rgb_indices, sample.image_hw)
@@ -428,15 +469,14 @@ def main() -> None:
             block_metadata.append(
                 {
                     "block_index": block_index,
-                    "target_start": block_start,
-                    "target_rgb_indices": list(block_rgb_indices),
+                    "query_rgb_indices": list(block_rgb_indices),
+                    "query_latent_source_indices": list(block_latent_indices),
                     "history_latent_frames_before": history_before,
                     "retained_history_times": [
                         int(value) for value in retained_times
                     ],
-                    "history_latent_frames_after": (
-                        history_state.frame_count
-                    ),
+                    "appended_model_times": update_times.tolist(),
+                    "history_latent_frames_after": history_state.frame_count,
                 }
             )
             del memory, actions, latents
@@ -449,16 +489,13 @@ def main() -> None:
         "checkpoint": str(checkpoint_path),
         "item_name": args.item_name,
         "dataset_root": args.dataset_root,
-        "target_start": sample.target_start,
-        "target_rgb_indices": list(sample.target_rgb_indices),
-        "context_policy": sample_config.context_policy,
-        "memory_rgb_frames_before_vae": len(sample.memory_rgb_indices),
-        "memory_latent_candidates": int(
-            prepared["history_candidates"].item()
-        ),
-        "memory_latent_retained": int(
-            prepared["history_retained"].item()
-        ),
+        "capture_rgb_indices": list(sample.capture_rgb_indices),
+        "query_rgb_blocks": [
+            list(block) for block in sample.query_rgb_blocks
+        ],
+        "capture_origin_source_internal_index": sample.capture_start,
+        "trajectory_overlap_score": sample.trajectory_overlap_score,
+        "initial_capture_latent_frames": capture_latents.shape[2],
         "updated_history_latent_frames": history_state.frame_count,
         "num_blocks": args.num_blocks,
         "blocks": block_metadata,
@@ -466,9 +503,17 @@ def main() -> None:
         "guidance_scale": args.guidance_scale,
         "flow_shift": args.flow_shift,
         "seed": args.seed,
+        "cache_mode": "disabled; capture VAE runs online from RGB",
+        "query_input_note": (
+            "Only query camera poses/intrinsics enter generation. Query RGB is "
+            "read after generation for ground-truth evaluation only."
+        ),
+        "dynamic_update_note": (
+            "Each generated latent block is appended and memory is rebuilt "
+            "before the next block."
+        ),
         "paper_inference_note": (
-            "VGGT and the camera-query geometry head are intentionally absent "
-            "at inference, as specified by GIM-World."
+            "VGGT and the camera-query geometry head are discarded at inference."
         ),
     }
     (output_dir / "metadata.json").write_text(
