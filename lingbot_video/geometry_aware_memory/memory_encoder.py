@@ -139,7 +139,10 @@ class CompactSelfAttention(nn.Module):
         )
         k = self.to_k(x).reshape_as(q)
         v = self.to_v(x).reshape_as(q)
-        rotary = self.rope(position_ids)
+        # apply_rotary_emb expects RoPE as [B,S,D/2].  The shared position
+        # grid is [S,3], so LingBotVideoRotaryEmbedding returns [S,D/2];
+        # retain a singleton batch dimension and broadcast it across samples.
+        rotary = self.rope(position_ids).unsqueeze(0)
         q = apply_rotary_emb(self.norm_q(q), rotary)
         k = apply_rotary_emb(self.norm_k(k), rotary)
         output = F.scaled_dot_product_attention(
