@@ -15,6 +15,7 @@ from lingbot_video.geometry_aware_memory.data import (
     VipeRoomTourItem,
 )
 from lingbot_video.geometry_aware_memory.memory_encoder import (
+    CompactSelfAttention,
     GIMImplicitMemoryEncoder,
     GIMMemoryEncoderConfig,
 )
@@ -193,6 +194,31 @@ def test_memory_encoder_fixed_output_shape_and_gradients() -> None:
     memory.square().mean().backward()
     assert history.grad is not None
     assert encoder.memory_queries.grad is not None
+
+
+def test_compact_attention_broadcasts_shared_rope_over_batch() -> None:
+    attention = CompactSelfAttention(
+        hidden_size=32,
+        num_heads=4,
+        norm_eps=1e-6,
+        axes_dims=(2, 2, 4),
+        axes_lens=(32, 32, 32),
+        rope_theta=256.0,
+    )
+    hidden = torch.randn(2, 12, 32, requires_grad=True)
+    position_ids = torch.stack(
+        torch.meshgrid(
+            torch.arange(3, dtype=torch.int32),
+            torch.arange(2, dtype=torch.int32),
+            torch.arange(2, dtype=torch.int32),
+            indexing="ij",
+        ),
+        dim=-1,
+    ).flatten(0, 2)
+    output = attention(hidden, position_ids)
+    assert output.shape == hidden.shape
+    output.square().mean().backward()
+    assert hidden.grad is not None
 
 
 def test_lingbot_memory_is_temporal_prefix_but_output_is_target_only() -> None:
