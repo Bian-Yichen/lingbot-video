@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import random
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -26,6 +27,10 @@ from lingbot_video.geometry_aware_memory.pruning import (
     PoseTimeKernelConfig,
 )
 from lingbot_video.geometry_aware_memory.teacher import vggt_target_hw
+from lingbot_video.geometry_aware_memory.training import (
+    _require_streamable_wan_vae,
+    _reset_wan_encoder_state,
+)
 from lingbot_video.transformer_lingbot_video import LingBotVideoTransformer3DModel
 
 
@@ -52,6 +57,28 @@ def test_trajectory_lengths_must_match_causal_vae_stride() -> None:
         GeometryMemorySampleConfig(
             capture_frame_stride_min=1,
         ).validate()
+
+
+def test_wan_streaming_state_is_initialized_lazily() -> None:
+    class LazyWanVAE:
+        config = SimpleNamespace(
+            scale_factor_temporal=4,
+            patch_size=None,
+        )
+        encoder = object()
+        quant_conv = object()
+
+        def clear_cache(self) -> None:
+            self._enc_feat_map = [None, None]
+            self._enc_conv_idx = [0]
+
+    vae = LazyWanVAE()
+    assert not hasattr(vae, "_enc_feat_map")
+    assert not hasattr(vae, "_enc_conv_idx")
+    _require_streamable_wan_vae(vae, temporal_stride=4)
+    _reset_wan_encoder_state(vae)
+    assert vae._enc_feat_map == [None, None]
+    assert vae._enc_conv_idx == [0]
 
 
 def test_capture_curriculum_reaches_full_length() -> None:
