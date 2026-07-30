@@ -72,21 +72,23 @@ def _require_streamable_wan_vae(
     vae: torch.nn.Module,
     temporal_stride: int,
 ) -> None:
+    # AutoencoderKLWan creates its encoder feature-state attributes lazily in
+    # clear_cache().  They therefore must not be required immediately after
+    # from_pretrained(), before clear_cache() has run for the first time.
     missing = [
         name
         for name in (
             "clear_cache",
             "encoder",
             "quant_conv",
-            "_enc_feat_map",
-            "_enc_conv_idx",
         )
         if not hasattr(vae, name)
     ]
     if missing:
         raise TypeError(
-            "online trajectory encoding requires diffusers AutoencoderKLWan's "
-            f"official causal feature-state API; missing attributes: {missing}"
+            "online trajectory encoding requires a compatible diffusers "
+            "AutoencoderKLWan causal encoder; "
+            f"missing attributes: {missing}"
         )
     configured_stride = int(
         getattr(vae.config, "scale_factor_temporal", temporal_stride)
@@ -99,6 +101,30 @@ def _require_streamable_wan_vae(
     if getattr(vae.config, "patch_size", None) is not None:
         raise NotImplementedError(
             "online trajectory encoding does not support a patchified Wan VAE"
+        )
+
+
+def _reset_wan_encoder_state(vae: torch.nn.Module) -> None:
+    """Initialize a fresh causal encoder state for one trajectory."""
+
+    vae.clear_cache()
+    missing = [
+        name
+        for name in ("_enc_feat_map", "_enc_conv_idx")
+        if not hasattr(vae, name)
+    ]
+    if missing:
+        raise TypeError(
+            "AutoencoderKLWan.clear_cache() did not initialize the causal "
+            f"encoder state required for streaming: {missing}"
+        )
+    if not isinstance(vae._enc_feat_map, list) or not isinstance(
+        vae._enc_conv_idx, list
+    ):
+        raise TypeError(
+            "AutoencoderKLWan causal encoder state has an unsupported type: "
+            f"_enc_feat_map={type(vae._enc_feat_map).__name__}, "
+            f"_enc_conv_idx={type(vae._enc_conv_idx).__name__}"
         )
 
 
@@ -138,7 +164,7 @@ def encode_wan_scene_streaming(
         else contextlib.nullcontext()
     )
     latent_chunks: list[torch.Tensor] = []
-    vae.clear_cache()
+    _reset_wan_encoder_state(vae)
     position = 0
     first_read = True
     try:
