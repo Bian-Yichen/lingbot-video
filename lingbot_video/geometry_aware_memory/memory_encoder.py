@@ -48,10 +48,6 @@ class CompactLinear(nn.Module):
         # x is [B,F,H,W,D].
         batch, frames, height, width, dim = x.shape
         stride = self.stride
-        if height % stride or width % stride:
-            raise ValueError(
-                f"patch grid {height}x{width} is not divisible by compact stride {stride}"
-            )
         if self.expand:
             projected = self.projection(x)
             projected = projected.reshape(
@@ -72,6 +68,10 @@ class CompactLinear(nn.Module):
                     width * stride,
                     dim,
                 )
+            )
+        if height % stride or width % stride:
+            raise ValueError(
+                f"patch grid {height}x{width} is not divisible by compact stride {stride}"
             )
         return self.projection(
             x.reshape(
