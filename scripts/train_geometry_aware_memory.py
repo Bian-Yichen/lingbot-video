@@ -392,6 +392,18 @@ def main() -> None:
         item_list=_read_item_list(args.item_list),
         seed=args.seed,
     )
+    logger.info(
+        "dataset eligibility epoch=1 total=%d eligible=%d skipped=%d%s",
+        dataset.total_item_count,
+        len(dataset),
+        dataset.skipped_item_count,
+        (
+            " skipped_examples="
+            + ",".join(dataset.skipped_items[:5])
+            if dataset.skipped_items
+            else ""
+        ),
+    )
     loader_generator = torch.Generator().manual_seed(args.seed)
     dataloader = DataLoader(
         dataset,
@@ -478,6 +490,8 @@ def main() -> None:
         "dataset_root": args.dataset_root,
         "data_access": "direct_local_filesystem",
         "dataset_items": len(dataset),
+        "dataset_items_total": dataset.total_item_count,
+        "dataset_items_skipped_epoch_1": dataset.skipped_item_count,
         "scene_iterations_per_epoch": len(dataset),
         "scene_sampling": (
             "one_random_interleaved_capture_query_window_per_scene_per_epoch"
@@ -622,11 +636,14 @@ def main() -> None:
         )
         if accelerator.is_main_process:
             logger.info(
-                "epoch=%d/%d scenes=%d capture_window_bounds=%s "
+                "epoch=%d/%d scenes=%d/%d skipped=%d "
+                "capture_window_bounds=%s "
                 "predicted_update_probability=%.3f",
                 epoch + 1,
                 args.num_train_epochs,
                 len(dataset),
+                dataset.total_item_count,
+                dataset.skipped_item_count,
                 sample_config.capture_window_bounds_for_epoch(epoch),
                 update_probability,
             )
