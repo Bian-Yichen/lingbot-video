@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import random
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -22,6 +23,25 @@ from .geometry import (
 # source video.  The whole GIM pipeline operates on a contiguous 0..N-1
 # internal timeline after this conversion.
 SOURCE_FRAME_STRIDE = 5
+_ITEM_SOURCE_RANGE = re.compile(r"_(\d+)_(\d+)\.mp4$")
+
+
+def estimate_sparse_frame_count(item_name: str) -> Optional[int]:
+    """Estimate the usable 0,5,10,... RGB count from a scene directory name.
+
+    Dataset names end in ``_<source_start>_<source_end>.mp4``.  Integer
+    division is deliberately conservative when the source span is not
+    divisible by five, so the fast prefilter never admits a borderline short
+    scene based on a one-frame overestimate.
+    """
+
+    match = _ITEM_SOURCE_RANGE.search(Path(item_name).name)
+    if match is None:
+        return None
+    source_start, source_end = (int(value) for value in match.groups())
+    if source_end <= source_start:
+        return 0
+    return (source_end - source_start) // SOURCE_FRAME_STRIDE
 
 
 class LocalRoomTourIndex:
@@ -184,6 +204,35 @@ class GeometryMemorySampleConfig:
             fractional_minimum,
         )
         return min(minimum, maximum), maximum
+
+
+def has_interleaved_sample_for_frame_count(
+    frame_count: int,
+    config: GeometryMemorySampleConfig,
+    epoch: int,
+) -> bool:
+    """Whether a contiguous sparse timeline can supply one training sample."""
+
+    lower, upper = config.capture_window_bounds_for_epoch(epoch)
+    upper = min(upper, int(frame_count))
+    if upper < lower:
+        return False
+    temporal_stride = config.vae_temporal_stride
+    query_groups = (
+        config.query_rgb_frames + temporal_stride - 1
+    ) // temporal_stride
+    for capture_stride in range(
+        config.capture_frame_stride_min,
+        config.capture_frame_stride_max + 1,
+    ):
+        window_step = temporal_stride * capture_stride
+        lower_groups = (
+            max(lower - 1, 0) + window_step - 1
+        ) // window_step
+        groups = max(1, query_groups, lower_groups)
+        if 1 + groups * window_step <= upper:
+            return True
+    return False
 
 
 @dataclass(frozen=True)
@@ -635,29 +684,82 @@ class LocalVipeRoomTourDataset(Dataset[RoomTourSample]):
         super().__init__()
         self.item_index = LocalRoomTourIndex(dataset_root)
         self.sample_config = sample_config
-        self.items = (
+        items = (
             self.item_index.list_items()
             if item_list is None
             else list(item_list)
         )
-        if not self.items:
+        if not items:
             raise ValueError("item_list cannot be empty")
-        for item_name in self.items:
+        for item_name in items:
             self.item_index.item_path(item_name)
+        self.all_items = tuple(items)
+        self._estimated_frame_counts = tuple(
+            estimate_sparse_frame_count(item_name)
+            for item_name in self.all_items
+        )
+        self.items: list[str] = []
+        self._active_ordinals: list[int] = []
+        self.skipped_items: tuple[str, ...] = ()
         self.seed = int(seed)
-        self.epoch = 0
+        self.epoch = -1
+        self.set_epoch(0)
+
+    @property
+    def total_item_count(self) -> int:
+        return len(self.all_items)
+
+    @property
+    def skipped_item_count(self) -> int:
+        return len(self.skipped_items)
 
     def set_epoch(self, epoch: int) -> None:
         self.epoch = int(epoch)
+        active: list[tuple[int, str]] = []
+        skipped: list[str] = []
+        for ordinal, (item_name, estimated_frames) in enumerate(
+            zip(
+                self.all_items,
+                self._estimated_frame_counts,
+                strict=True,
+            )
+        ):
+            # Non-standard names cannot be prefiltered cheaply. Keep them and
+            # let VipeRoomTourItem's exact common-modality index validate them.
+            if (
+                estimated_frames is None
+                or has_interleaved_sample_for_frame_count(
+                    estimated_frames,
+                    self.sample_config,
+                    self.epoch,
+                )
+            ):
+                active.append((ordinal, item_name))
+            else:
+                skipped.append(item_name)
+        if not active:
+            lower, upper = self.sample_config.capture_window_bounds_for_epoch(
+                self.epoch
+            )
+            raise RuntimeError(
+                "no dataset item can supply an interleaved sample for "
+                f"epoch={self.epoch}, capture_window={lower}..{upper}, "
+                f"query_rgb={self.sample_config.query_rgb_frames}"
+            )
+        self._active_ordinals = [ordinal for ordinal, _ in active]
+        self.items = [item_name for _, item_name in active]
+        self.skipped_items = tuple(skipped)
 
     def __len__(self) -> int:
         return len(self.items)
 
     def __getitem__(self, index: int) -> RoomTourSample:
-        item_name = self.items[int(index)]
+        active_index = int(index)
+        item_name = self.items[active_index]
+        stable_ordinal = self._active_ordinals[active_index]
         item = VipeRoomTourItem(self.item_index.item_path(item_name))
         rng = random.Random(
-            self.seed + 1_000_003 * self.epoch + 10_007 * int(index)
+            self.seed + 1_000_003 * self.epoch + 10_007 * stable_ordinal
         )
         return item.make_sample(
             self.sample_config,
