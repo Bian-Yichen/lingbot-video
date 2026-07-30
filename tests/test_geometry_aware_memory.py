@@ -15,6 +15,7 @@ from lingbot_video.geometry_aware_memory.data import (
     VipeRoomTourItem,
 )
 from lingbot_video.geometry_aware_memory.memory_encoder import (
+    CompactLinear,
     CompactSelfAttention,
     GIMImplicitMemoryEncoder,
     GIMMemoryEncoderConfig,
@@ -194,6 +195,16 @@ def test_memory_encoder_fixed_output_shape_and_gradients() -> None:
     memory.square().mean().backward()
     assert history.grad is not None
     assert encoder.memory_queries.grad is not None
+
+
+def test_compact_expand_restores_real_lingbot_patch_grid_shape() -> None:
+    hidden = torch.randn(2, 3, 30, 52, 32)
+    compact = CompactLinear(32, 2, expand=False)
+    expand = CompactLinear(32, 2, expand=True)
+    compacted = compact(hidden)
+    restored = expand(compacted)
+    assert compacted.shape == (2, 3, 15, 26, 32)
+    assert restored.shape == hidden.shape
 
 
 def test_compact_attention_broadcasts_shared_rope_over_batch() -> None:
