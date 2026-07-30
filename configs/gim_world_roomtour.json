@@ -1,9 +1,11 @@
 {
-  "model_dir": "/path/to/lingbot-video-dense-1.3b",
-  "dataset_root": "/path/to/mounted/AnyReconProDataset_labeled_2",
-  "output_dir": "/path/to/outputs/gim_world_geometry_memory",
+  "model_dir": "/mnt/shared-storage-user/bianyichen/lingbot-video-dense-1.3b",
+  "dataset_root": "/data/bianyichen/H-hdd/AnyReconProDataset_labeled_2",
+  "output_dir": "/mnt/shared-storage-user/bianyichen/lingbot-video-output",
   "resume_from_checkpoint": null,
-  "item_list": null,
+  "item_list": [
+    "zx8lnpzDG58_012000_017000.mp4"
+  ],
   "prompt": "An indoor room tour.",
   "height": 480,
   "width": 832,
@@ -29,7 +31,7 @@
   "sigma_time": 50.0,
   "kernel_jitter": 1e-5,
   "timestep_shift": 1.0,
-  "vggt_model_id": "facebook/VGGT-1B",
+  "vggt_model_id": "/mnt/shared-storage-user/bianyichen/VGGT-1B",
   "predicted_update_probability_start": 0.0,
   "predicted_update_probability_end": 0.0,
   "predicted_update_warmup_epochs": 5,
