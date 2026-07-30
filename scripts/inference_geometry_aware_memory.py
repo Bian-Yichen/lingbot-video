@@ -7,6 +7,7 @@ import logging
 import random
 import sys
 from pathlib import Path
+from typing import Any
 
 import imageio.v3 as iio
 import numpy as np
@@ -18,8 +19,7 @@ sys.path.insert(0, str(REPO_ROOT))
 
 from lingbot_video.geometry_aware_memory.data import (  # noqa: E402
     GeometryMemorySampleConfig,
-    RcloneConfig,
-    RoomTourItemCache,
+    LocalRoomTourIndex,
     VipeRoomTourItem,
 )
 from lingbot_video.geometry_aware_memory.model import (  # noqa: E402
@@ -50,27 +50,30 @@ from lingbot_video.transformer_lingbot_video import (  # noqa: E402
 logger = logging.getLogger("lingbot_video.inference_geometry_aware_memory")
 
 
+def _config_defaults() -> dict[str, Any]:
+    bootstrap = argparse.ArgumentParser(add_help=False)
+    bootstrap.add_argument("--config", default=None)
+    known, _ = bootstrap.parse_known_args()
+    if not known.config:
+        return {}
+    payload = json.loads(Path(known.config).read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError("inference config must be one JSON object")
+    return payload
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Evaluate a GIM-World LingBot checkpoint on one withheld room-tour block."
     )
-    parser.add_argument("--checkpoint", required=True)
+    parser.add_argument("--config", required=True)
+    parser.add_argument("--checkpoint", default=None)
     parser.add_argument("--model_dir", default=None)
-    parser.add_argument("--item_name", required=True)
+    parser.add_argument("--item_name", default=None)
     parser.add_argument("--target_start", type=int, default=None)
-    parser.add_argument(
-        "--dataset_root",
-        default="h:bianyichen/AnyReconProDataset_labeled_2/",
-    )
-    parser.add_argument(
-        "--cache_root",
-        default="/tmp/lingbot_gim_world_cache",
-    )
-    parser.add_argument(
-        "--latent_cache_root",
-        default="/tmp/lingbot_gim_world_latents",
-    )
-    parser.add_argument("--output_dir", required=True)
+    parser.add_argument("--dataset_root", default=None)
+    parser.add_argument("--latent_cache_root", default=None)
+    parser.add_argument("--output_dir", default=None)
     parser.add_argument("--prompt", default=None)
     parser.add_argument("--negative_prompt", default=DEFAULT_NEGATIVE_PROMPT)
     parser.add_argument("--num_inference_steps", type=int, default=40)
@@ -92,14 +95,19 @@ def parse_args() -> argparse.Namespace:
         choices=["fp16", "bf16"],
         default="bf16",
     )
-    parser.add_argument("--rclone_binary", default="rclone")
-    parser.add_argument("--rclone_config", default=None)
-    parser.add_argument(
-        "--rclone_clear_proxy",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-    )
+    parser.set_defaults(**_config_defaults())
     args = parser.parse_args()
+    for name in (
+        "checkpoint",
+        "item_name",
+        "dataset_root",
+        "latent_cache_root",
+        "output_dir",
+    ):
+        if not getattr(args, name):
+            parser.error(f"--{name} is required (it may be supplied by --config)")
+    if args.negative_prompt is None:
+        args.negative_prompt = DEFAULT_NEGATIVE_PROMPT
     if args.num_blocks < 1:
         parser.error("--num_blocks must be positive")
     return args
@@ -193,17 +201,9 @@ def main() -> None:
     del model.geometry_head
     model.eval().to(device)
 
-    cache = RoomTourItemCache(
-        args.dataset_root,
-        args.cache_root,
-        rclone=RcloneConfig(
-            binary=args.rclone_binary,
-            config_path=args.rclone_config,
-            clear_proxy=args.rclone_clear_proxy,
-        ),
-    )
-    logger.info("materializing scene %s", args.item_name)
-    item = VipeRoomTourItem(cache.materialize(args.item_name))
+    item_path = LocalRoomTourIndex(args.dataset_root).item_path(args.item_name)
+    logger.info("opening mounted scene directly: %s", item_path)
+    item = VipeRoomTourItem(item_path)
     sample_config = GeometryMemorySampleConfig(
         height=model_config.image_height,
         width=model_config.image_width,

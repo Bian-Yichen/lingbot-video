@@ -20,8 +20,7 @@ sys.path.insert(0, str(REPO_ROOT))
 
 from lingbot_video.geometry_aware_memory.data import (  # noqa: E402
     GeometryMemorySampleConfig,
-    RcloneConfig,
-    RemoteVipeRoomTourDataset,
+    LocalVipeRoomTourDataset,
     RoomTourSample,
 )
 from lingbot_video.geometry_aware_memory.model import (  # noqa: E402
@@ -69,23 +68,16 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Train GIM-World geometry-aware memory on LingBot-Video."
     )
-    parser.add_argument("--config", default=None)
+    parser.add_argument("--config", required=True)
     parser.add_argument("--model_dir", required=False)
-    parser.add_argument(
-        "--dataset_root",
-        default="h:bianyichen/AnyReconProDataset_labeled_2/",
-    )
-    parser.add_argument(
-        "--cache_root",
-        default="/tmp/lingbot_gim_world_cache",
-    )
+    parser.add_argument("--dataset_root", default=None)
     parser.add_argument(
         "--latent_cache_root",
-        default="/tmp/lingbot_gim_world_latents",
+        default=None,
     )
     parser.add_argument(
         "--teacher_cache_root",
-        default="/tmp/lingbot_gim_world_vggt",
+        default=None,
     )
     parser.add_argument(
         "--output_dir",
@@ -142,19 +134,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--checkpoint_every", type=int, default=1000)
     parser.add_argument("--resume_from_checkpoint", default=None)
     parser.add_argument("--item_list", default=None)
-    parser.add_argument("--rclone_binary", default="rclone")
-    parser.add_argument("--rclone_config", default=None)
-    parser.add_argument(
-        "--rclone_clear_proxy",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-    )
-    parser.add_argument("--rclone_transfers", type=int, default=32)
-    parser.add_argument("--rclone_checkers", type=int, default=32)
     parser.set_defaults(**_config_defaults())
     args = parser.parse_args()
     if not args.model_dir:
         parser.error("--model_dir is required (it may be supplied by --config)")
+    if not args.dataset_root:
+        parser.error("--dataset_root is required (it may be supplied by --config)")
+    if not args.latent_cache_root:
+        parser.error(
+            "--latent_cache_root is required (it may be supplied by --config)"
+        )
+    if not args.teacher_cache_root:
+        parser.error(
+            "--teacher_cache_root is required (it may be supplied by --config)"
+        )
     if args.height % 16 or args.width % 16:
         parser.error("--height and --width must be multiples of 16")
     if args.pruning_budget < 1:
@@ -172,12 +165,16 @@ def _dtype(name: str) -> torch.dtype:
     }[name]
 
 
-def _read_item_list(path: str | None) -> list[str] | None:
-    if not path:
+def _read_item_list(value: str | list[str] | None) -> list[str] | None:
+    if not value:
         return None
+    if isinstance(value, list):
+        if not all(isinstance(item, str) and item.strip() for item in value):
+            raise ValueError("item_list entries must be non-empty strings")
+        return [item.strip().rstrip("/") for item in value]
     return [
         line.strip().rstrip("/")
-        for line in Path(path).read_text(encoding="utf-8").splitlines()
+        for line in Path(value).read_text(encoding="utf-8").splitlines()
         if line.strip() and not line.lstrip().startswith("#")
     ]
 
@@ -307,17 +304,9 @@ def main() -> None:
         context_policy=args.context_policy,
     )
     sample_config.validate()
-    dataset = RemoteVipeRoomTourDataset(
+    dataset = LocalVipeRoomTourDataset(
         args.dataset_root,
-        args.cache_root,
         sample_config,
-        rclone=RcloneConfig(
-            binary=args.rclone_binary,
-            config_path=args.rclone_config,
-            clear_proxy=args.rclone_clear_proxy,
-            transfers=args.rclone_transfers,
-            checkers=args.rclone_checkers,
-        ),
         item_list=_read_item_list(args.item_list),
         seed=args.seed,
         rank=accelerator.process_index,
@@ -364,7 +353,7 @@ def main() -> None:
         weight_decay=args.weight_decay,
         betas=(0.9, 0.999),
     )
-    # The iterable dataset already shards remote items by process/worker.  Do
+    # The iterable dataset already shards local items by process/worker.  Do
     # not wrap it in Accelerate's IterableDatasetShard a second time.
     model, optimizer = accelerator.prepare(
         model,
@@ -424,7 +413,7 @@ def main() -> None:
     compact_width = patch_width // args.compact_stride
     run_summary = {
         "dataset_root": args.dataset_root,
-        "cache_root": args.cache_root,
+        "data_access": "direct_local_filesystem",
         "dataset_items": len(dataset.items),
         "samples_per_item_reuse": args.samples_per_item,
         "training_samples_per_dataset_pass": (

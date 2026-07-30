@@ -2,8 +2,8 @@
 
 from .data import (
     GeometryMemorySampleConfig,
-    RemoteVipeRoomTourDataset,
-    RoomTourItemCache,
+    LocalRoomTourIndex,
+    LocalVipeRoomTourDataset,
     VipeRoomTourItem,
 )
 from .model import GIMWorldLingBotModel, GIMWorldModelConfig
@@ -15,9 +15,9 @@ __all__ = [
     "GIMWorldModelConfig",
     "DynamicGIMHistory",
     "GeometryMemorySampleConfig",
+    "LocalRoomTourIndex",
+    "LocalVipeRoomTourDataset",
     "MIGreedyPruner",
     "PoseTimeKernelConfig",
-    "RemoteVipeRoomTourDataset",
-    "RoomTourItemCache",
     "VipeRoomTourItem",
 ]

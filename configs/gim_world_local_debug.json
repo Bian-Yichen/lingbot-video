@@ -1,0 +1,14 @@
+{
+  "dataset_root": "/path/to/mounted/AnyReconProDataset_labeled_2",
+  "item_name": "zx8lnpzDG58_012000_017000.mp4",
+  "height": 480,
+  "width": 832,
+  "target_rgb_frames": 81,
+  "vae_temporal_stride": 4,
+  "target_start": 800,
+  "min_memory_rgb_frames": 800,
+  "target_guard_rgb_frames": 128,
+  "context_policy": "prefix",
+  "seed": 42,
+  "break_after_resolve": false
+}

@@ -6,6 +6,7 @@ import torch
 import lingbot_video.transformer_lingbot_video as lingbot_transformer
 from lingbot_video.geometry_aware_memory.data import (
     GeometryMemorySampleConfig,
+    LocalRoomTourIndex,
 )
 from lingbot_video.geometry_aware_memory.memory_encoder import (
     GIMImplicitMemoryEncoder,
@@ -25,6 +26,16 @@ from lingbot_video.transformer_lingbot_video import LingBotVideoTransformer3DMod
 
 def test_vggt_grid_matches_roomtour_default() -> None:
     assert vggt_target_hw((480, 832)) == (294, 518)
+
+
+def test_local_roomtour_index_uses_mounted_scene_in_place(tmp_path) -> None:
+    scene = tmp_path / "scene_000.mp4"
+    scene.mkdir()
+    index = LocalRoomTourIndex(tmp_path)
+    assert index.list_items() == ["scene_000.mp4"]
+    assert index.item_path("scene_000.mp4") == scene
+    with pytest.raises(ValueError, match="direct child"):
+        index.item_path("../scene_000.mp4")
 
 
 def test_offline_context_rejects_target_leaking_guard() -> None:

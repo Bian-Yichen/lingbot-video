@@ -1,10 +1,11 @@
 {
   "model_dir": "/path/to/lingbot-video-dense-1.3b",
-  "dataset_root": "h:bianyichen/AnyReconProDataset_labeled_2/",
-  "cache_root": "/tmp/lingbot_gim_world_cache",
-  "latent_cache_root": "/tmp/lingbot_gim_world_latents",
-  "teacher_cache_root": "/tmp/lingbot_gim_world_vggt",
-  "output_dir": "outputs/gim_world_geometry_memory",
+  "dataset_root": "/path/to/mounted/AnyReconProDataset_labeled_2",
+  "latent_cache_root": "/path/to/persistent/gim_world_cache/latents",
+  "teacher_cache_root": "/path/to/persistent/gim_world_cache/vggt",
+  "output_dir": "/path/to/outputs/gim_world_geometry_memory",
+  "resume_from_checkpoint": null,
+  "item_list": null,
   "prompt": "An indoor room tour.",
   "height": 480,
   "width": 832,
@@ -36,8 +37,5 @@
   "dataloader_workers": 0,
   "seed": 42,
   "log_every": 10,
-  "checkpoint_every": 1000,
-  "rclone_clear_proxy": true,
-  "rclone_transfers": 32,
-  "rclone_checkers": 32
+  "checkpoint_every": 1000
 }

@@ -5,6 +5,7 @@ import json
 import random
 import sys
 from pathlib import Path
+from typing import Any
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -12,26 +13,32 @@ sys.path.insert(0, str(REPO_ROOT))
 
 from lingbot_video.geometry_aware_memory.data import (  # noqa: E402
     GeometryMemorySampleConfig,
-    RcloneConfig,
-    RoomTourItemCache,
+    LocalRoomTourIndex,
     VipeRoomTourItem,
 )
 
 
+def _config_defaults() -> dict[str, Any]:
+    bootstrap = argparse.ArgumentParser(add_help=False)
+    bootstrap.add_argument("--config", default=None)
+    known, _ = bootstrap.parse_known_args()
+    if not known.config:
+        return {}
+    payload = json.loads(Path(known.config).read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError("debug config must be one JSON object")
+    return payload
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--item_name", required=True)
-    parser.add_argument(
-        "--dataset_root",
-        default="h:bianyichen/AnyReconProDataset_labeled_2/",
-    )
-    parser.add_argument(
-        "--cache_root",
-        default="/tmp/lingbot_gim_world_cache",
-    )
+    parser.add_argument("--config", required=True)
+    parser.add_argument("--item_name", default=None)
+    parser.add_argument("--dataset_root", default=None)
     parser.add_argument("--height", type=int, default=480)
     parser.add_argument("--width", type=int, default=832)
     parser.add_argument("--target_rgb_frames", type=int, default=81)
+    parser.add_argument("--vae_temporal_stride", type=int, default=4)
     parser.add_argument("--target_start", type=int, default=None)
     parser.add_argument("--min_memory_rgb_frames", type=int, default=800)
     parser.add_argument("--target_guard_rgb_frames", type=int, default=128)
@@ -42,36 +49,34 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
-        "--break_after_download",
+        "--break_after_resolve",
         action=argparse.BooleanOptionalAction,
         default=False,
     )
-    parser.add_argument("--rclone_binary", default="rclone")
-    parser.add_argument("--rclone_config", default=None)
-    return parser.parse_args()
+    parser.set_defaults(**_config_defaults())
+    args = parser.parse_args()
+    if not args.item_name:
+        parser.error("--item_name is required (it may be supplied by --config)")
+    if not args.dataset_root:
+        parser.error("--dataset_root is required (it may be supplied by --config)")
+    return args
 
 
 def main() -> None:
     args = parse_args()
-    cache = RoomTourItemCache(
-        args.dataset_root,
-        args.cache_root,
-        rclone=RcloneConfig(
-            binary=args.rclone_binary,
-            config_path=args.rclone_config,
-        ),
-    )
-    print(f"Materializing {args.item_name} from {args.dataset_root}")
-    local_root = cache.materialize(args.item_name)
+    print(f"Resolving {args.item_name} below {args.dataset_root}")
+    item_index = LocalRoomTourIndex(args.dataset_root)
+    local_root = item_index.item_path(args.item_name)
     print(f"local_root={local_root}")
-    if args.break_after_download:
-        print("Breakpoint variables: local_root, cache, args")
+    if args.break_after_resolve:
+        print("Breakpoint variables: local_root, item_index, args")
         breakpoint()
     item = VipeRoomTourItem(local_root)
     config = GeometryMemorySampleConfig(
         height=args.height,
         width=args.width,
         target_rgb_frames=args.target_rgb_frames,
+        vae_temporal_stride=args.vae_temporal_stride,
         min_memory_rgb_frames=args.min_memory_rgb_frames,
         target_guard_rgb_frames=args.target_guard_rgb_frames,
         samples_per_item=1,

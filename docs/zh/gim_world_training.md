@@ -4,13 +4,28 @@
 
 ## 数据时间轴
 
-远程数据默认从：
+数据直接从机器上已经挂载好的本地目录读取，例如：
 
 ```text
-h:bianyichen/AnyReconProDataset_labeled_2/
+/mnt/datasets/AnyReconProDataset_labeled_2/
 ```
 
-读取。ViPE 的 RGB、pose 和 intrinsics 都只保留源视频的 `0,5,10,...` 帧；loader 首先把它们归一成内部连续时间轴 `0,1,2,...`。例如，一个 5000 帧源视频条目会成为约 1000 帧训练序列。
+`dataset_root` 的直接子目录就是 scene 条目。loader 不调用 rclone，也不会把
+RGB、pose、intrinsics 或 metadata 复制到 `/tmp`；训练 worker 直接打开
+`dataset_root/<item_name>/...`。每个条目的基本结构为：
+
+```text
+<dataset_root>/<item_name>/
+├── RGB/
+├── chunk_metadata.json
+└── vipe/vipe_artifacts/
+    ├── pose/video.npz
+    └── intrinsics/video.npz
+```
+
+ViPE 的 RGB、pose 和 intrinsics 都只保留源视频的 `0,5,10,...` 帧；loader
+首先把它们归一成内部连续时间轴 `0,1,2,...`。例如，一个 5000 帧源视频
+条目会成为约 1000 帧训练序列。
 
 每个 scene 第一次出现时，代码按 Wan VAE 官方 `_encode` 的时序调度运行：
 首帧单独进入 encoder，之后每 4 帧一组；所有 causal convolution 的
@@ -32,7 +47,7 @@ causal state 独立编码成 21 latent frames，保证其首 latent 语义与推
 1. 从满足最少 800 帧历史的位置中选择连续 81 张 RGB 作为监督目标，对应 21 个 VAE latent frames。
 2. 默认 `context_policy=prefix`，target 之前的全部 observation 都是 memory；在 1000 帧条目中每次约有 800–919 张历史 RGB，即约 200–230 个历史 latent frames。
 3. 所有候选历史 latent 都进入论文的 pose-time GP mutual-information greedy selection，保留 `K=200`。这不是 frame retrieval：目标 camera pose 不参与选择，选择只压缩完整 capture history。
-4. 被选中的 latent 按原时间顺序进入 memory encoder。一个 scene 默认连续产生 16 个不同 target window 的 iteration，从而摊薄下载和 VAE 编码成本。
+4. 被选中的 latent 按原时间顺序进入 memory encoder。一个 scene 默认连续产生 16 个不同 target window 的 iteration，从而复用已经建立的整场 VAE latent cache。
 
 这与论文的因果 rollout 数据协议一致，也从机制上避免监督 RGB 通过未来的
 causal VAE receptive field 泄漏进 memory。`all_except_target` 仍作为离线
@@ -95,17 +110,21 @@ pip install -r requirements-glibc217-cu118.txt
 pip install -r requirements-gim-world.txt
 ```
 
-修改 `configs/gim_world_roomtour.json` 中的 `model_dir`，然后：
+修改 `configs/gim_world_roomtour.json` 中的本地 `dataset_root`、`model_dir`、
+两个派生 cache 路径和 `output_dir`，然后：
 
 ```bash
 accelerate launch scripts/train_geometry_aware_memory.py \
   --config configs/gim_world_roomtour.json
 ```
 
-训练 loop 开始前会打印 dataset remote、条目数、scene reuse 次数、分辨率、目标长度、MI budget、memory 容量、总参数量、可训练参数量、world size、effective batch size 和学习率。TensorBoard event 写到 `output_dir`：
+训练 loop 开始前会打印本地 dataset 路径、条目数、scene reuse 次数、分辨率、
+目标长度、MI budget、memory 容量、总参数量、可训练参数量、world size、
+effective batch size 和学习率。TensorBoard event 写到 config 指定的
+`output_dir`：
 
 ```bash
-tensorboard --logdir outputs/gim_world_geometry_memory
+tensorboard --logdir /path/from/config/output_dir
 ```
 
 主要曲线：
@@ -121,15 +140,13 @@ tensorboard --logdir outputs/gim_world_geometry_memory
 
 ## 启动推理
 
-推理复用与训练完全相同的 causal prefix、scene latent cache、target window、camera normalization、MI pruning、memory encoder 和 action path：
+先修改 `configs/gim_world_local_inference.json`。推理复用与训练完全相同的
+causal prefix、scene latent cache、target window、camera normalization、
+MI pruning、memory encoder 和 action path：
 
 ```bash
 python scripts/inference_geometry_aware_memory.py \
-  --checkpoint outputs/gim_world_geometry_memory/checkpoint-00008000 \
-  --item_name zx8lnpzDG58_012000_017000.mp4 \
-  --target_start 400 \
-  --num_blocks 1 \
-  --output_dir outputs/gim_world_eval/zx8
+  --config configs/gim_world_local_inference.json
 ```
 
 输出：
@@ -150,3 +167,17 @@ python scripts/inference_geometry_aware_memory.py \
 block 的 latent 和 camera 会 append 到 history，下一次生成前重新执行 MI
 pruning 和 memory encoder。它不是把旧 memory slots 递归写回自身，因此不会
 把一次压缩误差永久固化；history 增长时，送进 encoder 的数量仍被 `K` 限制。
+
+## 数据 debug
+
+修改 `configs/gim_world_local_debug.json` 后，可在不加载模型的情况下检查一个
+挂载 scene 的索引范围、合法 target 和 memory 数量：
+
+```bash
+python scripts/debug_geometry_aware_memory_data.py \
+  --config configs/gim_world_local_debug.json
+```
+
+将 config 中的 `break_after_resolve` 设为 `true`，会在 scene 本地路径解析完成、
+尚未索引 RGB/pose/intrinsics 时进入断点。此时没有下载步骤，`local_root`
+就是挂载目录中的原始 scene 路径。

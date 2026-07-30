@@ -1,0 +1,18 @@
+{
+  "checkpoint": "/path/to/outputs/gim_world_geometry_memory/checkpoint-00008000",
+  "model_dir": "/path/to/lingbot-video-dense-1.3b",
+  "dataset_root": "/path/to/mounted/AnyReconProDataset_labeled_2",
+  "latent_cache_root": "/path/to/persistent/gim_world_cache/latents",
+  "item_name": "zx8lnpzDG58_012000_017000.mp4",
+  "target_start": 800,
+  "output_dir": "/path/to/outputs/gim_world_eval/zx8",
+  "prompt": null,
+  "negative_prompt": null,
+  "num_inference_steps": 40,
+  "num_blocks": 1,
+  "guidance_scale": 6.0,
+  "flow_shift": 3.0,
+  "seed": 42,
+  "fps": 6.0,
+  "mixed_precision": "bf16"
+}
