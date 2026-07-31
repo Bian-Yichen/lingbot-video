@@ -29,6 +29,12 @@ from lingbot_video.geometry_aware_memory.model import (  # noqa: E402
     GIMWorldLingBotModel,
     GIMWorldModelConfig,
 )
+from lingbot_video.geometry_aware_memory.lora import (  # noqa: E402
+    DEFAULT_BACKBONE_LORA_TARGETS,
+    inject_backbone_lora,
+    lora_config_from_mapping,
+    validate_partial_checkpoint_load,
+)
 from lingbot_video.geometry_aware_memory.pruning import (  # noqa: E402
     MIGreedyPruner,
     PoseTimeKernelConfig,
@@ -139,9 +145,20 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument(
         "--backbone_train_mode",
-        choices=["full", "frozen"],
+        choices=["full", "frozen", "lora"],
         default="full",
-        help="full is the paper setting; frozen is a memory-only ablation.",
+        help=(
+            "full is the paper setting; frozen is a memory-only ablation; "
+            "lora adapts the backbone without saving its frozen base weights."
+        ),
+    )
+    parser.add_argument("--lora_rank", type=int, default=32)
+    parser.add_argument("--lora_alpha", type=float, default=32.0)
+    parser.add_argument("--lora_dropout", type=float, default=0.0)
+    parser.add_argument(
+        "--lora_target_modules",
+        nargs="+",
+        default=list(DEFAULT_BACKBONE_LORA_TARGETS),
     )
     parser.add_argument("--learning_rate", type=float, default=1e-5)
     parser.add_argument("--weight_decay", type=float, default=0.0)
@@ -162,6 +179,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--log_every", type=int, default=10)
     parser.add_argument("--checkpoint_every_epochs", type=int, default=1)
+    parser.add_argument(
+        "--save_optimizer_state",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Keep AdamW state for exact resume. Disable it for a much smaller "
+            "inference checkpoint that resumes with a fresh optimizer."
+        ),
+    )
 
     parser.set_defaults(**_config_defaults())
     args = parser.parse_args()
@@ -194,6 +220,11 @@ def parse_args() -> argparse.Namespace:
             parser.error(f"--{name} must be in [0,1]")
     if args.predicted_update_warmup_epochs < 1:
         parser.error("--predicted_update_warmup_epochs must be positive")
+    if args.backbone_train_mode == "lora":
+        try:
+            lora_config_from_mapping(vars(args))
+        except (TypeError, ValueError) as error:
+            parser.error(str(error))
     return args
 
 
@@ -482,14 +513,16 @@ def _checkpoint_payload(
             )
         )
     }
-    return {
+    payload = {
         "model": state,
         "global_step": int(step),
         "next_epoch": int(next_epoch),
         "model_config": model.gim_config.to_dict(),
         "training_config": vars(args),
-        "optimizer": optimizer.state_dict(),
     }
+    if args.save_optimizer_state:
+        payload["optimizer"] = optimizer.state_dict()
+    return payload
 
 
 def _scheduled_probability(args: argparse.Namespace, epoch: int) -> float:
@@ -584,7 +617,16 @@ def main() -> None:
         args,
         accelerator.device,
     )
-    backbone.requires_grad_(args.backbone_train_mode == "full")
+    lora_summary = None
+    if args.backbone_train_mode == "full":
+        backbone.requires_grad_(True)
+    elif args.backbone_train_mode == "frozen":
+        backbone.requires_grad_(False)
+    else:
+        lora_summary = inject_backbone_lora(
+            backbone,
+            lora_config_from_mapping(vars(args)),
+        )
     teacher_hw = vggt_target_hw((args.height, args.width))
     model = GIMWorldLingBotModel(
         backbone,
@@ -711,6 +753,27 @@ def main() -> None:
         "compact_stride": args.compact_stride,
         "geometry_loss_weight": args.geometry_loss_weight,
         "backbone_train_mode": args.backbone_train_mode,
+        "lora_rank": (
+            args.lora_rank if args.backbone_train_mode == "lora" else 0
+        ),
+        "lora_alpha": (
+            args.lora_alpha if args.backbone_train_mode == "lora" else 0.0
+        ),
+        "lora_dropout": (
+            args.lora_dropout if args.backbone_train_mode == "lora" else 0.0
+        ),
+        "lora_target_modules": (
+            list(args.lora_target_modules)
+            if args.backbone_train_mode == "lora"
+            else []
+        ),
+        "lora_injected_modules": (
+            lora_summary.module_count if lora_summary is not None else 0
+        ),
+        "lora_trainable_parameters": (
+            lora_summary.parameter_count if lora_summary is not None else 0
+        ),
+        "checkpoint_saves_optimizer_state": args.save_optimizer_state,
         "total_parameters": total_parameters,
         "trainable_parameters": trainable_parameters,
         "memory_encoder_parameters": sum(
@@ -777,10 +840,20 @@ def main() -> None:
             checkpoint["model"],
             strict=False,
         )
+        validate_partial_checkpoint_load(
+            missing,
+            unexpected,
+            backbone_train_mode=args.backbone_train_mode,
+        )
         global_step = int(checkpoint.get("global_step", 0))
         start_epoch = int(checkpoint.get("next_epoch", 0))
         if "optimizer" in checkpoint:
             optimizer.load_state_dict(checkpoint["optimizer"])
+        else:
+            logger.warning(
+                "checkpoint has no optimizer state; resuming model/epoch with "
+                "a freshly initialized AdamW optimizer"
+            )
         logger.info(
             "resumed epoch=%d step=%d missing=%d unexpected=%d",
             start_epoch,
