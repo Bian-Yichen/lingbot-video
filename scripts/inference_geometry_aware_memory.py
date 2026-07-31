@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import gc
 import json
 import logging
 import random
@@ -9,6 +10,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
+import imageio.v2 as iio_v2
 import imageio.v3 as iio
 import numpy as np
 import torch
@@ -20,6 +22,7 @@ sys.path.insert(0, str(REPO_ROOT))
 from lingbot_video.geometry_aware_memory.data import (  # noqa: E402
     GeometryMemorySampleConfig,
     LocalRoomTourIndex,
+    SOURCE_FRAME_STRIDE,
     VipeRoomTourItem,
 )
 from lingbot_video.geometry_aware_memory.inference import (  # noqa: E402
@@ -92,6 +95,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--fps", type=float, default=6.0)
     parser.add_argument(
+        "--save_capture_video",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Save the exact sparse capture sequence supplied to memory.",
+    )
+    parser.add_argument(
         "--mixed_precision",
         choices=["fp16", "bf16"],
         default="bf16",
@@ -146,6 +155,89 @@ def _save_video(path: Path, frames: np.ndarray, fps: float) -> None:
     )
 
 
+def _save_indexed_video(
+    path: Path,
+    item: VipeRoomTourItem,
+    indices: tuple[int, ...],
+    target_hw: tuple[int, int],
+    fps: float,
+) -> None:
+    """Stream a potentially long capture video without holding it in RAM."""
+    with iio_v2.get_writer(
+        path,
+        fps=fps,
+        codec="libx264",
+        quality=8,
+        pixelformat="yuv420p",
+    ) as writer:
+        for index in indices:
+            frame = (
+                item.read_rgb(index, target_hw)
+                .permute(1, 2, 0)
+                .mul(255.0)
+                .clamp_(0, 255)
+                .byte()
+                .numpy()
+            )
+            writer.append_data(frame)
+
+
+def _load_checkpoint(path: Path) -> dict[str, Any]:
+    kwargs: dict[str, Any] = {
+        "map_location": "cpu",
+        "weights_only": False,
+    }
+    try:
+        # Current checkpoints also contain AdamW state. mmap avoids eagerly
+        # copying the entire multi-GB archive into anonymous CPU memory.
+        checkpoint = torch.load(path, mmap=True, **kwargs)
+    except TypeError:
+        checkpoint = torch.load(path, **kwargs)
+    if not isinstance(checkpoint, dict):
+        raise TypeError("checkpoint must contain one dictionary")
+    for required in ("model", "model_config", "training_config"):
+        if required not in checkpoint:
+            raise KeyError(f"checkpoint is missing required key {required!r}")
+    # The optimizer is irrelevant for inference and can otherwise keep many
+    # GB of mapped tensors alive in the Python object graph.
+    checkpoint.pop("optimizer", None)
+    return checkpoint
+
+
+def _sample_epoch_from_checkpoint(
+    checkpoint: dict[str, Any],
+    requested_epoch: int | None,
+) -> int:
+    if requested_epoch is not None:
+        if requested_epoch < 0:
+            raise ValueError("sample_epoch cannot be negative")
+        return int(requested_epoch)
+    # Checkpoints are saved after an epoch with next_epoch pointing at the
+    # following zero-based epoch. Reuse the most recently trained curriculum.
+    return max(int(checkpoint.get("next_epoch", 1)) - 1, 0)
+
+
+def _validate_loaded_state(
+    missing: list[str],
+    unexpected: list[str],
+    *,
+    backbone_train_mode: str,
+) -> None:
+    allowed_missing = (
+        set(missing)
+        if backbone_train_mode == "frozen"
+        and all(name.startswith("backbone.") for name in missing)
+        else set()
+    )
+    invalid_missing = sorted(set(missing) - allowed_missing)
+    if invalid_missing or unexpected:
+        raise RuntimeError(
+            "checkpoint does not match the GIM model: "
+            f"missing={invalid_missing[:16]}, "
+            f"unexpected={sorted(unexpected)[:16]}"
+        )
+
+
 def main() -> None:
     args = parse_args()
     logging.basicConfig(
@@ -153,11 +245,8 @@ def main() -> None:
         format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
     )
     checkpoint_path = _checkpoint_file(args.checkpoint)
-    checkpoint = torch.load(
-        checkpoint_path,
-        map_location="cpu",
-        weights_only=False,
-    )
+    logger.info("loading checkpoint %s", checkpoint_path)
+    checkpoint = _load_checkpoint(checkpoint_path)
     training_config = checkpoint.get("training_config", {})
     if "capture_window_min_rgb_frames" not in training_config:
         raise ValueError(
@@ -199,19 +288,25 @@ def main() -> None:
     pipe.vae.requires_grad_(False).eval()
     model_config = GIMWorldModelConfig(**checkpoint["model_config"])
     model = GIMWorldLingBotModel(pipe.transformer, model_config)
+    checkpoint_model = checkpoint.pop("model")
     missing, unexpected = model.load_state_dict(
-        checkpoint["model"],
+        checkpoint_model,
         strict=False,
     )
-    allowed_missing = (
-        training_config.get("backbone_train_mode") == "frozen"
-        and all(name.startswith("backbone.") for name in missing)
+    del checkpoint_model
+    gc.collect()
+    _validate_loaded_state(
+        missing,
+        unexpected,
+        backbone_train_mode=str(
+            training_config.get("backbone_train_mode", "full")
+        ),
     )
-    if unexpected or (missing and not allowed_missing):
+    if missing:
         logger.warning(
-            "checkpoint load missing=%d unexpected=%d",
+            "loaded frozen-backbone checkpoint; restored %d omitted backbone "
+            "tensors from model_dir",
             len(missing),
-            len(unexpected),
         )
     # VGGT and the geometry decoder are training-only in GIM-World.
     del model.geometry_head
@@ -219,6 +314,15 @@ def main() -> None:
 
     item_path = LocalRoomTourIndex(args.dataset_root).item_path(args.item_name)
     item = VipeRoomTourItem(item_path)
+    trained_query_blocks = int(training_config.get("query_blocks", 1))
+    if args.num_blocks != trained_query_blocks:
+        logger.warning(
+            "checkpoint trained with query_blocks=%d but inference requested "
+            "num_blocks=%d; blocks after the first use generated-latent memory "
+            "and are rollout evaluation, not an input exactly seen in training",
+            trained_query_blocks,
+            args.num_blocks,
+        )
     sample_config = GeometryMemorySampleConfig(
         height=model_config.image_height,
         width=model_config.image_width,
@@ -266,10 +370,10 @@ def main() -> None:
             training_config.get("trajectory_rotation_weight", 0.25)
         ),
     )
-    sample_epoch = (
-        max(sample_config.capture_window_curriculum_epochs - 1, 0)
-        if args.sample_epoch is None
-        else args.sample_epoch
+    sample_config.validate()
+    sample_epoch = _sample_epoch_from_checkpoint(
+        checkpoint,
+        args.sample_epoch,
     )
     sample = item.make_sample(
         sample_config,
@@ -281,10 +385,11 @@ def main() -> None:
         capture_frame_stride=args.capture_frame_stride,
     )
     logger.info(
-        "scene=%s window=%d:%d stride=%d capture=%d RGB "
+        "scene=%s sample_epoch=%d window=%d:%d stride=%d capture=%d RGB "
         "query=%d:%d (%d blocks) "
         "coverage_score=%.4f",
         args.item_name,
+        sample_epoch,
         sample.capture_window_start,
         sample.capture_window_end,
         sample.capture_frame_stride,
@@ -297,6 +402,10 @@ def main() -> None:
 
     # Inference input contains capture RGB only. Query RGB is never encoded;
     # it is read after generation solely for evaluation videos.
+    logger.info(
+        "encoding %d capture RGB frames with the online Wan VAE",
+        len(sample.capture_rgb_indices),
+    )
     capture_latents = encode_wan_scene_streaming(
         pipe.vae,
         item,
@@ -342,6 +451,10 @@ def main() -> None:
             args.negative_prompt,
             device=device,
         )
+    pipe.text_encoder.to("cpu")
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
     pruner = MIGreedyPruner(
         PoseTimeKernelConfig(
             sigma_position=float(
@@ -402,6 +515,16 @@ def main() -> None:
                     target_c2w,
                     target_intrinsics,
                 )
+            logger.info(
+                "block=%d/%d history=%d retained=%d memory_shape=%s "
+                "target_latent_frames=%d",
+                block_index + 1,
+                len(sample.query_rgb_blocks),
+                history_before,
+                int(retained_positions.numel()),
+                tuple(memory.shape),
+                len(block_latent_indices),
+            )
 
             latents = torch.randn(
                 latent_shape,
@@ -487,6 +610,12 @@ def main() -> None:
                 ground_truth,
                 args.fps,
             )
+            _save_video(
+                output_dir
+                / f"comparison_gt_generated_block_{block_index:03d}.mp4",
+                np.concatenate((ground_truth, generated), axis=2),
+                args.fps,
+            )
             block_metadata.append(
                 {
                     "block_index": block_index,
@@ -506,6 +635,20 @@ def main() -> None:
     ground_truth = np.concatenate(ground_truth_blocks, axis=0)
     _save_video(output_dir / "generated.mp4", generated, args.fps)
     _save_video(output_dir / "ground_truth.mp4", ground_truth, args.fps)
+    _save_video(
+        output_dir / "comparison_gt_generated.mp4",
+        np.concatenate((ground_truth, generated), axis=2),
+        args.fps,
+    )
+    if args.save_capture_video:
+        logger.info("saving the sparse capture conditioning video")
+        _save_indexed_video(
+            output_dir / "conditioning_capture.mp4",
+            item,
+            sample.capture_rgb_indices,
+            sample.image_hw,
+            args.fps,
+        )
     metadata = {
         "checkpoint": str(checkpoint_path),
         "item_name": args.item_name,
@@ -517,10 +660,27 @@ def main() -> None:
         "capture_frame_stride": sample.capture_frame_stride,
         "query_phase_offset": sample.query_phase_offset,
         "capture_rgb_indices": list(sample.capture_rgb_indices),
+        "capture_source_rgb_indices": [
+            int(index) * SOURCE_FRAME_STRIDE
+            for index in sample.capture_rgb_indices
+        ],
         "query_rgb_blocks": [
             list(block) for block in sample.query_rgb_blocks
         ],
-        "capture_origin_source_internal_index": sample.capture_start,
+        "query_source_rgb_blocks": [
+            [
+                int(index) * SOURCE_FRAME_STRIDE
+                for index in block
+            ]
+            for block in sample.query_rgb_blocks
+        ],
+        "capture_origin_internal_index": sample.capture_start,
+        "capture_origin_source_rgb_index": (
+            sample.capture_start * SOURCE_FRAME_STRIDE
+        ),
+        "sample_epoch": sample_epoch,
+        "checkpoint_next_epoch": int(checkpoint.get("next_epoch", 0)),
+        "checkpoint_global_step": int(checkpoint.get("global_step", 0)),
         "trajectory_overlap_score": sample.trajectory_overlap_score,
         "initial_capture_latent_frames": capture_latents.shape[2],
         "updated_history_latent_frames": history_state.frame_count,
@@ -530,6 +690,9 @@ def main() -> None:
         "guidance_scale": args.guidance_scale,
         "flow_shift": args.flow_shift,
         "seed": args.seed,
+        "resolution": list(sample.image_hw),
+        "mixed_precision": args.mixed_precision,
+        "save_capture_video": args.save_capture_video,
         "cache_mode": "disabled; capture VAE runs online from RGB",
         "query_input_note": (
             "Only query camera poses/intrinsics enter generation. Query RGB is "
