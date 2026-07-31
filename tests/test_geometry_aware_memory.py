@@ -37,10 +37,43 @@ from lingbot_video.geometry_aware_memory.training import (
     _reset_wan_encoder_state,
 )
 from lingbot_video.transformer_lingbot_video import LingBotVideoTransformer3DModel
+from scripts.inference_geometry_aware_memory import (
+    _sample_epoch_from_checkpoint,
+    _validate_loaded_state,
+)
 
 
 def test_vggt_grid_matches_roomtour_default() -> None:
     assert vggt_target_hw((480, 832)) == (294, 518)
+
+
+def test_inference_defaults_to_checkpoint_last_completed_epoch() -> None:
+    assert _sample_epoch_from_checkpoint({"next_epoch": 1}, None) == 0
+    assert _sample_epoch_from_checkpoint({"next_epoch": 5}, None) == 4
+    assert _sample_epoch_from_checkpoint({"next_epoch": 5}, 2) == 2
+    with pytest.raises(ValueError, match="cannot be negative"):
+        _sample_epoch_from_checkpoint({"next_epoch": 5}, -1)
+
+
+def test_inference_checkpoint_validation_allows_only_frozen_backbone() -> None:
+    _validate_loaded_state([], [], backbone_train_mode="full")
+    _validate_loaded_state(
+        ["backbone.blocks.0.weight"],
+        [],
+        backbone_train_mode="frozen",
+    )
+    with pytest.raises(RuntimeError, match="memory_encoder"):
+        _validate_loaded_state(
+            ["memory_encoder.memory_queries"],
+            [],
+            backbone_train_mode="frozen",
+        )
+    with pytest.raises(RuntimeError, match="unexpected"):
+        _validate_loaded_state(
+            [],
+            ["unknown.weight"],
+            backbone_train_mode="full",
+        )
 
 
 def test_local_roomtour_index_uses_mounted_scene_in_place(tmp_path) -> None:
