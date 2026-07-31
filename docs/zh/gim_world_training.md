@@ -153,6 +153,48 @@ patch embedding 之后作为 temporal prefix 放到 noisy query tokens 前；主
 返回 query 的 13 个 latent frame。query camera action embedding 加到 timestep
 modulation path，不通过点云或 RGB pose rendering 注入。
 
+## LingBot backbone 的三种训练模式
+
+`backbone_train_mode` 支持三种值：
+
+| 模式 | LingBot backbone | checkpoint 中的 backbone 权重 | 用途 |
+|---|---|---|---|
+| `full` | 全参数训练 | 完整保存 | 论文原始 joint training 设置，效果基线 |
+| `frozen` | 完全冻结 | 不保存 | 仅用于 smoke test / memory-only ablation |
+| `lora` | 冻结 base、训练 LoRA | 只保存 LoRA A/B | 当前推荐的低存储训练设置 |
+
+LoRA 默认注入每个 LingBot block 的 attention `to_q/to_k/to_v/to_out`
+和 dense FFN `gate_proj/up_proj/down_proj`。对于 1.3B dense backbone、
+24 blocks、rank 32，约新增 31.5M 个 backbone 可训练参数。LoRA B 使用零
+初始化，因此刚注入时 backbone 数值行为与原 checkpoint 完全一致；随后 flow
+loss 和 geometry-memory 路径共同训练 LoRA 与 GIM 新模块。
+
+配置示例：
+
+```json
+{
+  "backbone_train_mode": "lora",
+  "lora_rank": 32,
+  "lora_alpha": 32.0,
+  "lora_dropout": 0.0,
+  "lora_target_modules": [
+    "to_q", "to_k", "to_v", "to_out",
+    "gate_proj", "up_proj", "down_proj"
+  ],
+  "save_optimizer_state": true
+}
+```
+
+`save_optimizer_state=true` 支持完全一致地续训，但 AdamW 状态仍会占用明显
+磁盘空间。若 checkpoint 只用于 inference，可以设为 `false`；模型、LoRA 和
+训练进度仍会保存，但以后 resume 会使用新初始化的 AdamW 状态。inference 会
+从 checkpoint 的 `training_config` 自动恢复 LoRA 结构，不需要在 inference
+config 中重复填写 rank 或 target modules。
+
+需要注意：`lora` 是针对 LingBot 嫁接的参数高效适配，不是 GIM-World 论文的
+原始全参数训练设置；但它允许生成主干真正学习读取新加入的 memory prefix，
+比完全冻结 backbone 更适合正式实验。
+
 ## 启动训练
 
 先安装基础环境和官方 VGGT：
