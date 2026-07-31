@@ -33,7 +33,19 @@
   "predicted_update_probability_start": 0.0,
   "predicted_update_probability_end": 0.0,
   "predicted_update_warmup_epochs": 5,
-  "backbone_train_mode":  "frozen",
+  "backbone_train_mode": "lora",
+  "lora_rank": 32,
+  "lora_alpha": 32.0,
+  "lora_dropout": 0.0,
+  "lora_target_modules": [
+    "to_q",
+    "to_k",
+    "to_v",
+    "to_out",
+    "gate_proj",
+    "up_proj",
+    "down_proj"
+  ],
   "learning_rate": 1e-5,
   "weight_decay": 0.0,
   "num_train_epochs": 20,
@@ -44,5 +56,6 @@
   "dataloader_workers": 0,
   "seed": 42,
   "log_every": 10,
-  "checkpoint_every_epochs": 1
+  "checkpoint_every_epochs": 1,
+  "save_optimizer_state": true
 }
