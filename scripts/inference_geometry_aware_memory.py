@@ -28,6 +28,11 @@ from lingbot_video.geometry_aware_memory.data import (  # noqa: E402
 from lingbot_video.geometry_aware_memory.inference import (  # noqa: E402
     DynamicGIMHistory,
 )
+from lingbot_video.geometry_aware_memory.lora import (  # noqa: E402
+    inject_backbone_lora,
+    lora_config_from_mapping,
+    validate_partial_checkpoint_load,
+)
 from lingbot_video.geometry_aware_memory.model import (  # noqa: E402
     GIMWorldLingBotModel,
     GIMWorldModelConfig,
@@ -223,19 +228,11 @@ def _validate_loaded_state(
     *,
     backbone_train_mode: str,
 ) -> None:
-    allowed_missing = (
-        set(missing)
-        if backbone_train_mode == "frozen"
-        and all(name.startswith("backbone.") for name in missing)
-        else set()
+    validate_partial_checkpoint_load(
+        missing,
+        unexpected,
+        backbone_train_mode=backbone_train_mode,
     )
-    invalid_missing = sorted(set(missing) - allowed_missing)
-    if invalid_missing or unexpected:
-        raise RuntimeError(
-            "checkpoint does not match the GIM model: "
-            f"missing={invalid_missing[:16]}, "
-            f"unexpected={sorted(unexpected)[:16]}"
-        )
 
 
 def main() -> None:
@@ -286,6 +283,15 @@ def main() -> None:
         )
     pipe.to(device)
     pipe.vae.requires_grad_(False).eval()
+    backbone_train_mode = str(
+        training_config.get("backbone_train_mode", "full")
+    )
+    lora_summary = None
+    if backbone_train_mode == "lora":
+        lora_summary = inject_backbone_lora(
+            pipe.transformer,
+            lora_config_from_mapping(training_config),
+        )
     model_config = GIMWorldModelConfig(**checkpoint["model_config"])
     model = GIMWorldLingBotModel(pipe.transformer, model_config)
     checkpoint_model = checkpoint.pop("model")
@@ -298,15 +304,21 @@ def main() -> None:
     _validate_loaded_state(
         missing,
         unexpected,
-        backbone_train_mode=str(
-            training_config.get("backbone_train_mode", "full")
-        ),
+        backbone_train_mode=backbone_train_mode,
     )
     if missing:
         logger.warning(
-            "loaded frozen-backbone checkpoint; restored %d omitted backbone "
-            "tensors from model_dir",
+            "loaded %s-backbone checkpoint; restored %d omitted frozen "
+            "backbone tensors from model_dir",
+            backbone_train_mode,
             len(missing),
+        )
+    if lora_summary is not None:
+        logger.info(
+            "loaded backbone LoRA modules=%d trainable_parameters=%d rank=%d",
+            lora_summary.module_count,
+            lora_summary.parameter_count,
+            int(training_config.get("lora_rank", 32)),
         )
     # VGGT and the geometry decoder are training-only in GIM-World.
     del model.geometry_head
