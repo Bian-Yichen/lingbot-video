@@ -230,7 +230,18 @@ class LingBotVideoAttention(nn.Module):
         parallel_config=None,
     ):
         B, S, _ = x.shape
-        if os.environ.get("LINGBOT_FUSED_QKV_LINEAR") == "1":
+        # Fusing by directly reading q/k/v ``weight`` would bypass the
+        # low-rank residual of a LoRALinear wrapper. Keep the fused path for
+        # ordinary Linear layers, but use their forwards whenever adapters
+        # are active.
+        qkv_has_lora = any(
+            hasattr(layer, "lora_a")
+            for layer in (self.to_q, self.to_k, self.to_v)
+        )
+        if (
+            os.environ.get("LINGBOT_FUSED_QKV_LINEAR") == "1"
+            and not qkv_has_lora
+        ):
             weight = torch.cat(
                 (self.to_q.weight, self.to_k.weight, self.to_v.weight),
                 dim=0,
