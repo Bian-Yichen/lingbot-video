@@ -1,9 +1,9 @@
 {
-  "checkpoint": "/path/to/outputs/gim_world_geometry_memory/checkpoint-epoch-0020-step-00000000",
-  "model_dir": "/path/to/lingbot-video-dense-1.3b",
-  "dataset_root": "/path/to/mounted/AnyReconProDataset_labeled_2",
-  "item_name": "zx8lnpzDG58_012000_017000.mp4",
-  "output_dir": "/path/to/outputs/gim_world_eval/zx8",
+  "checkpoint": null,
+  "model_dir": "/mnt/shared-storage-user/bianyichen/lingbot-video-dense-1.3b",
+  "dataset_root": "/data/bianyichen/H-hdd/AnyReconProDataset_labeled_2",
+  "item_name": null,
+  "output_dir": "/mnt/shared-storage-user/bianyichen/lingbot-video-output/gim_world_inference",
   "capture_start": null,
   "query_start": null,
   "capture_rgb_frames": null,
@@ -17,5 +17,6 @@
   "flow_shift": 3.0,
   "seed": 42,
   "fps": 6.0,
+  "save_capture_video": true,
   "mixed_precision": "bf16"
 }
