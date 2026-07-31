@@ -187,21 +187,45 @@ epoch 开始。
 
 ## 推理
 
-修改 `configs/gim_world_local_inference.json` 后运行：
+`checkpoint` 可以指向 `trainable_components.pt`，也可以指向包含该文件的
+checkpoint 目录。配置好固定的 `model_dir`、`dataset_root` 和默认输出目录后，
+每次只需要在命令行指定 checkpoint、scene 名称和本次输出目录：
 
 ```bash
 python scripts/inference_geometry_aware_memory.py \
-  --config configs/gim_world_local_inference.json
+  --config configs/gim_world_local_inference.json \
+  --checkpoint /path/to/checkpoint-epoch-0001-step-00001105 \
+  --item_name zx8lnpzDG58_012000_017000.mp4 \
+  --output_dir /path/to/inference/zx8_epoch1
 ```
 
 随机采样时使用与训练相同的 window/stride/phase/query-crop 构造器。固定实验
 必须同时指定 `capture_start`、`query_start`、`capture_rgb_frames` 和
-`capture_frame_stride`。
+`capture_frame_stride`，这四个参数都位于除以 5 后的内部连续时间轴。
+
+若没有显式指定 `sample_epoch`，脚本读取 checkpoint 的 `next_epoch`，使用该
+checkpoint 最近完成 epoch 的 capture-window curriculum。例如 epoch-1
+checkpoint 默认仍采样 257–321 帧 window，而不会错误地跳到最终的
+750–1000 帧阶段。`seed` 同时决定随机 capture/query 构造和初始生成噪声；
+保存的 `metadata.json` 记录完整内部 index 和对应的原始 RGB index，可用于复现。
 
 推理只编码 capture RGB；query 只输入 camera pose/intrinsics。每个生成 block
 的 latent 会追加到 `DynamicGIMHistory`，下一 block 前重新执行 MI pruning 和
 `m_t=M(H_t)`。query GT RGB 只在生成完成后读取并保存
 `ground_truth*.mp4`，绝不参与生成。VGGT 和 geometry head 不在推理时运行。
+
+默认 `num_blocks=1`，与当前单 query-block 训练完全一致。如果主动设置为大于
+1，后续 block 会把前一 block 的生成 latent 写回 history；脚本会明确警告这是
+长 rollout 测试，而不是当前 stage 训练时见过的输入。
+
+主要输出：
+
+- `conditioning_capture.mp4`：真正输入 memory 的稀疏 capture sequence；
+- `generated.mp4`：去噪得到的 target sequence；
+- `ground_truth.mp4`：生成完成后才读取的 withheld target RGB；
+- `comparison_gt_generated.mp4`：左侧 GT、右侧生成结果；
+- `metadata.json`：采样 index、pose 原点、memory retained 数、checkpoint 和
+  scheduler 参数。
 
 ## 数据 debug
 
