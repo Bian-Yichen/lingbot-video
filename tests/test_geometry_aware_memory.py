@@ -23,6 +23,11 @@ from lingbot_video.geometry_aware_memory.memory_encoder import (
     GIMImplicitMemoryEncoder,
     GIMMemoryEncoderConfig,
 )
+from lingbot_video.geometry_aware_memory.lora import (
+    BackboneLoRAConfig,
+    LoRALinear,
+    inject_backbone_lora,
+)
 from lingbot_video.geometry_aware_memory.inference import DynamicGIMHistory
 from lingbot_video.geometry_aware_memory.geometry import (
     make_origin_direction_rays,
@@ -55,13 +60,24 @@ def test_inference_defaults_to_checkpoint_last_completed_epoch() -> None:
         _sample_epoch_from_checkpoint({"next_epoch": 5}, -1)
 
 
-def test_inference_checkpoint_validation_allows_only_frozen_backbone() -> None:
+def test_inference_checkpoint_validation_allows_partial_backbones() -> None:
     _validate_loaded_state([], [], backbone_train_mode="full")
     _validate_loaded_state(
         ["backbone.blocks.0.weight"],
         [],
         backbone_train_mode="frozen",
     )
+    _validate_loaded_state(
+        ["backbone.blocks.0.attn.to_q.base_layer.weight"],
+        [],
+        backbone_train_mode="lora",
+    )
+    with pytest.raises(RuntimeError, match="lora_a"):
+        _validate_loaded_state(
+            ["backbone.blocks.0.attn.to_q.lora_a.weight"],
+            [],
+            backbone_train_mode="lora",
+        )
     with pytest.raises(RuntimeError, match="memory_encoder"):
         _validate_loaded_state(
             ["memory_encoder.memory_queries"],
@@ -357,6 +373,100 @@ def test_lingbot_memory_is_temporal_prefix_but_output_is_target_only() -> None:
         return_dict=False,
     )[0]
     assert output.shape == target.shape
+
+
+def test_backbone_lora_freezes_base_and_updates_only_adapters() -> None:
+    model = LingBotVideoTransformer3DModel(
+        patch_size=(1, 2, 2),
+        in_channels=4,
+        out_channels=4,
+        hidden_size=32,
+        num_attention_heads=4,
+        depth=2,
+        intermediate_size=64,
+        text_dim=16,
+        freq_dim=16,
+        axes_dims=(2, 2, 4),
+        axes_lens=(128, 32, 32),
+    )
+    target_modules = (
+        "to_q",
+        "to_k",
+        "to_v",
+        "to_out",
+        "gate_proj",
+        "up_proj",
+        "down_proj",
+    )
+    summary = inject_backbone_lora(
+        model,
+        BackboneLoRAConfig(
+            rank=4,
+            alpha=4.0,
+            target_modules=target_modules,
+        ),
+    )
+    assert summary.module_count == 2 * len(target_modules)
+    assert isinstance(model.blocks[0].attn.to_q, LoRALinear)
+    trainable = {
+        name for name, parameter in model.named_parameters()
+        if parameter.requires_grad
+    }
+    assert trainable
+    assert all(".lora_a." in name or ".lora_b." in name for name in trainable)
+
+    target = torch.randn(1, 4, 3, 8, 12)
+    text = torch.randn(1, 5, 16)
+    memory = torch.randn(1, 2 * 4 * 6, 32)
+    actions = torch.randn(1, 3, 32)
+    output = model(
+        target,
+        torch.tensor([500.0]),
+        text,
+        memory_hidden_states=memory,
+        video_action_embeds=actions,
+        return_dict=False,
+    )[0]
+    output.square().mean().backward()
+    assert model.blocks[0].attn.to_q.lora_b.weight.grad is not None
+    assert model.blocks[0].attn.to_q.base_layer.weight.grad is None
+
+
+def test_fused_qkv_setting_does_not_bypass_lora(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model = LingBotVideoTransformer3DModel(
+        patch_size=(1, 2, 2),
+        in_channels=4,
+        out_channels=4,
+        hidden_size=32,
+        num_attention_heads=4,
+        depth=1,
+        intermediate_size=64,
+        text_dim=16,
+        freq_dim=16,
+        axes_dims=(2, 2, 4),
+        axes_lens=(128, 32, 32),
+    )
+    inject_backbone_lora(
+        model,
+        BackboneLoRAConfig(
+            rank=4,
+            alpha=4.0,
+            target_modules=("to_q", "to_k", "to_v"),
+        ),
+    )
+    monkeypatch.setenv("LINGBOT_FUSED_QKV_LINEAR", "1")
+    target = torch.randn(1, 4, 3, 8, 12)
+    text = torch.randn(1, 5, 16)
+    output = model(
+        target,
+        torch.tensor([500.0]),
+        text,
+        return_dict=False,
+    )[0]
+    output.mean().backward()
+    assert model.blocks[0].attn.to_q.lora_b.weight.grad is not None
 
 
 def test_packed_batch_uses_sdpa_without_flashattention3(
