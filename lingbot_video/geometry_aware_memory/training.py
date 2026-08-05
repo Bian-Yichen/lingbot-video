@@ -10,7 +10,7 @@ import torch.nn.functional as F
 
 from .data import RoomTourSample, VipeRoomTourItem
 from .model import GIMWorldLingBotModel
-from .profiling import ProfileTimings, synchronized_stage
+from .profiling import ProfileTimings, profiling_scope, synchronized_stage
 from .pruning import MIGreedyPruner
 from .teacher import VGGTGeometryTeacher
 
@@ -390,24 +390,27 @@ def gim_trajectory_training_step(
                 item_name=batch.sample.item_name,
                 frame_index=block.geometry_query_index,
             )
-        predicted, geometry_prediction, memory = model(
-            noisy,
-            sigma * 1000.0,
-            prompt_embeds,
-            history_latents=selected_latents,
-            history_c2w=selected_c2w,
-            history_intrinsics=selected_k,
-            target_c2w=target_c2w,
-            target_intrinsics=target_k,
-            query_c2w=block.geometry_query_c2w.to(device),
-            query_intrinsics=block.geometry_query_intrinsics.to(device),
-            teacher_image_hw=(
-                teacher_grid[0] * teacher.config.patch_size,
-                teacher_grid[1] * teacher.config.patch_size,
-            ),
-            encoder_attention_mask=prompt_mask,
-            profile_timings=profile_timings,
-        )
+        # DDP may copy ordinary Python kwargs. A rank-local context therefore
+        # carries the timing sink through the wrapper without changing any
+        # tensor input or relying on mutation of a scattered dict.
+        with profiling_scope(profile_timings):
+            predicted, geometry_prediction, memory = model(
+                noisy,
+                sigma * 1000.0,
+                prompt_embeds,
+                history_latents=selected_latents,
+                history_c2w=selected_c2w,
+                history_intrinsics=selected_k,
+                target_c2w=target_c2w,
+                target_intrinsics=target_k,
+                query_c2w=block.geometry_query_c2w.to(device),
+                query_intrinsics=block.geometry_query_intrinsics.to(device),
+                teacher_image_hw=(
+                    teacher_grid[0] * teacher.config.patch_size,
+                    teacher_grid[1] * teacher.config.patch_size,
+                ),
+                encoder_attention_mask=prompt_mask,
+            )
         with synchronized_stage(profile_timings, "loss_forward", device):
             flow_loss = F.mse_loss(
                 predicted.float(),
