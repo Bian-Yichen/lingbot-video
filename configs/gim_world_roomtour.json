@@ -52,6 +52,6 @@
   "dataloader_workers": 0,
   "seed": 42,
   "log_every": 10,
-  "checkpoint_every_epochs": 1,
+  "checkpoint_every_iterations": 200,
   "save_optimizer_state": false
 }
