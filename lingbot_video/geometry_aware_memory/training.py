@@ -18,8 +18,7 @@ from .teacher import VGGTGeometryTeacher
 class GIMTrainingConfig:
     pruning_budget: int = 200
     geometry_loss_weight: float = 0.05
-    vae_temporal_stride: int = 4
-    vae_encode_chunk_rgb_frames: int = 81
+    vae_encode_chunk_rgb_frames: int = 4
     timestep_shift: float = 1.0
     predicted_update_probability: float = 0.0
 
@@ -68,160 +67,87 @@ def _vae_latent_to_dit(
     return ((latents.float() - mean) * std_inv).to(latents.dtype)
 
 
-def _require_streamable_wan_vae(
-    vae: torch.nn.Module,
-    temporal_stride: int,
-) -> None:
-    # AutoencoderKLWan creates its encoder feature-state attributes lazily in
-    # clear_cache().  They therefore must not be required immediately after
-    # from_pretrained(), before clear_cache() has run for the first time.
-    missing = [
-        name
-        for name in (
-            "clear_cache",
-            "encoder",
-            "quant_conv",
-        )
-        if not hasattr(vae, name)
-    ]
+def _require_independent_wan_vae(vae: torch.nn.Module) -> None:
+    missing = [name for name in ("encode",) if not hasattr(vae, name)]
     if missing:
         raise TypeError(
-            "online trajectory encoding requires a compatible diffusers "
-            "AutoencoderKLWan causal encoder; "
+            "independent-frame encoding requires a compatible diffusers "
+            "AutoencoderKLWan; "
             f"missing attributes: {missing}"
-        )
-    configured_stride = int(
-        getattr(vae.config, "scale_factor_temporal", temporal_stride)
-    )
-    if configured_stride != temporal_stride:
-        raise ValueError(
-            "configured VAE temporal compression does not match the dataset "
-            f"timeline: VAE={configured_stride}, requested={temporal_stride}"
         )
     if getattr(vae.config, "patch_size", None) is not None:
         raise NotImplementedError(
-            "online trajectory encoding does not support a patchified Wan VAE"
-        )
-
-
-def _reset_wan_encoder_state(vae: torch.nn.Module) -> None:
-    """Initialize a fresh causal encoder state for one trajectory."""
-
-    vae.clear_cache()
-    missing = [
-        name
-        for name in ("_enc_feat_map", "_enc_conv_idx")
-        if not hasattr(vae, name)
-    ]
-    if missing:
-        raise TypeError(
-            "AutoencoderKLWan.clear_cache() did not initialize the causal "
-            f"encoder state required for streaming: {missing}"
-        )
-    if not isinstance(vae._enc_feat_map, list) or not isinstance(
-        vae._enc_conv_idx, list
-    ):
-        raise TypeError(
-            "AutoencoderKLWan causal encoder state has an unsupported type: "
-            f"_enc_feat_map={type(vae._enc_feat_map).__name__}, "
-            f"_enc_conv_idx={type(vae._enc_conv_idx).__name__}"
+            "independent-frame encoding does not support a patchified Wan VAE"
         )
 
 
 @torch.no_grad()
-def encode_wan_scene_streaming(
+def encode_wan_frames_independently(
     vae: torch.nn.Module,
     item: VipeRoomTourItem,
     indices: list[int] | tuple[int, ...],
     target_hw: tuple[int, int],
     *,
-    temporal_stride: int,
     read_chunk_rgb_frames: int,
     device: torch.device,
     dtype: torch.dtype,
 ) -> torch.Tensor:
-    """Encode one continuous RGB trajectory with one fresh Wan causal state."""
+    """Encode every RGB frame as an independent one-frame Wan sample.
 
-    _require_streamable_wan_vae(vae, temporal_stride)
+    Frames share only the VAE batch dimension. They never share causal feature
+    state, so the output temporal axis has exactly one latent per input RGB and
+    can be paired one-to-one with camera poses.
+    """
+
+    _require_independent_wan_vae(vae)
     indices = [int(index) for index in indices]
     if not indices:
-        raise ValueError("cannot encode an empty trajectory")
-    if (len(indices) - 1) % temporal_stride:
-        raise ValueError(
-            "trajectory length must equal 1 + k * temporal_stride"
-        )
-    if (
-        read_chunk_rgb_frames <= temporal_stride
-        or (read_chunk_rgb_frames - 1) % temporal_stride
-    ):
-        raise ValueError(
-            "read_chunk_rgb_frames must equal 1 + k * temporal_stride "
-            "with k >= 1"
-        )
+        raise ValueError("cannot encode an empty frame set")
+    if read_chunk_rgb_frames < 1:
+        raise ValueError("read_chunk_rgb_frames must be positive")
     autocast = (
         torch.autocast("cuda", dtype=dtype)
         if device.type == "cuda" and dtype in {torch.float16, torch.bfloat16}
         else contextlib.nullcontext()
     )
     latent_chunks: list[torch.Tensor] = []
-    _reset_wan_encoder_state(vae)
-    position = 0
-    first_read = True
-    try:
-        while position < len(indices):
-            read_count = (
-                read_chunk_rgb_frames
-                if first_read
-                else read_chunk_rgb_frames - 1
+    for position in range(0, len(indices), read_chunk_rgb_frames):
+        read_indices = indices[position : position + read_chunk_rgb_frames]
+        video = item.read_video(read_indices, target_hw)
+        images = (
+            video.permute(1, 0, 2, 3)
+            .unsqueeze(2)
+            .to(device=device, dtype=torch.float32)
+            .mul(2.0)
+            .sub(1.0)
+        )
+        with autocast:
+            encoded = vae.encode(images)
+        if hasattr(encoded, "latent_dist"):
+            distribution = encoded.latent_dist
+            latents = (
+                distribution.mode()
+                if callable(getattr(distribution, "mode", None))
+                else distribution.mean
             )
-            read_count = min(read_count, len(indices) - position)
-            read_indices = indices[position : position + read_count]
-            video = item.read_video(read_indices, target_hw)
-            local_position = 0
-            while local_position < video.shape[1]:
-                group_size = (
-                    1
-                    if position == 0 and local_position == 0
-                    else temporal_stride
-                )
-                group = video[
-                    :,
-                    local_position : local_position + group_size,
-                ]
-                if group.shape[1] != group_size:
-                    raise RuntimeError(
-                        "Wan causal group ended with an incomplete frame group"
-                    )
-                group = (
-                    group.unsqueeze(0)
-                    .to(device=device, dtype=torch.float32)
-                    .mul(2.0)
-                    .sub(1.0)
-                )
-                vae._enc_conv_idx = [0]
-                with autocast:
-                    features = vae.encoder(
-                        group,
-                        feat_cache=vae._enc_feat_map,
-                        feat_idx=vae._enc_conv_idx,
-                    )
-                    moments = vae.quant_conv(features)
-                latents = moments.chunk(2, dim=1)[0]
-                latent_chunks.append(
-                    _vae_latent_to_dit(vae, latents).cpu()
-                )
-                local_position += group_size
-                del group, features, moments, latents
-            position += read_count
-            first_read = False
-            del video
-    finally:
-        vae.clear_cache()
+        elif isinstance(encoded, tuple):
+            latents = encoded[0]
+        else:
+            latents = encoded
+        if latents.ndim != 5 or latents.shape[2] != 1:
+            raise RuntimeError(
+                "one-frame Wan encode must return [N,C,1,H,W], got "
+                f"{tuple(latents.shape)}"
+            )
+        dit_latents = _vae_latent_to_dit(vae, latents)
+        latent_chunks.append(
+            dit_latents.squeeze(2).permute(1, 0, 2, 3).unsqueeze(0).cpu()
+        )
+        del video, images, encoded, latents, dit_latents
     output = torch.cat(latent_chunks, dim=2)
-    expected = 1 + (len(indices) - 1) // temporal_stride
-    if output.shape[2] != expected:
+    if output.shape[2] != len(indices):
         raise RuntimeError(
-            f"Wan returned {output.shape[2]} latents, expected {expected}"
+            f"Wan returned {output.shape[2]} latents for {len(indices)} frames"
         )
     return output
 
@@ -231,7 +157,6 @@ def prepare_gim_trajectory_online(
     sample: RoomTourSample,
     *,
     vae: torch.nn.Module,
-    vae_temporal_stride: int,
     vae_encode_chunk_rgb_frames: int,
     device: torch.device,
     compute_dtype: torch.dtype,
@@ -240,19 +165,16 @@ def prepare_gim_trajectory_online(
 
     item = VipeRoomTourItem(Path(sample.local_root))
     origin_index = sample.capture_start
-    capture_latents = encode_wan_scene_streaming(
+    capture_latents = encode_wan_frames_independently(
         vae,
         item,
         sample.capture_rgb_indices,
         sample.image_hw,
-        temporal_stride=vae_temporal_stride,
         read_chunk_rgb_frames=vae_encode_chunk_rgb_frames,
         device=device,
         dtype=compute_dtype,
     )
-    capture_latent_indices = sample.capture_rgb_indices[
-        ::vae_temporal_stride
-    ]
+    capture_latent_indices = sample.capture_rgb_indices
     capture_c2w, capture_k = item.cameras(
         capture_latent_indices,
         sample.image_hw,
@@ -272,17 +194,16 @@ def prepare_gim_trajectory_online(
         sample.geometry_query_indices,
         strict=True,
     ):
-        latents = encode_wan_scene_streaming(
+        latents = encode_wan_frames_independently(
             vae,
             item,
             rgb_indices,
             sample.image_hw,
-            temporal_stride=vae_temporal_stride,
             read_chunk_rgb_frames=vae_encode_chunk_rgb_frames,
             device=device,
             dtype=compute_dtype,
         )
-        latent_rgb_indices = rgb_indices[::vae_temporal_stride]
+        latent_rgb_indices = rgb_indices
         c2w, intrinsics = item.cameras(
             latent_rgb_indices,
             sample.image_hw,
@@ -467,18 +388,12 @@ def gim_trajectory_training_step(
             else:
                 update_latents = target
             update_latents = update_latents.detach().cpu()
-            latent_time_step = (
-                batch.sample.capture_frame_stride
-                * config.vae_temporal_stride
-            )
-            next_time = int(history_times.max().item()) + latent_time_step
-            update_times = (
-                torch.arange(
-                    update_latents.shape[2],
-                    dtype=history_times.dtype,
-                )
-                * latent_time_step
-                + next_time
+            update_times = torch.tensor(
+                [
+                    int(index) - batch.sample.capture_start
+                    for index in block.latent_rgb_indices
+                ],
+                dtype=history_times.dtype,
             )
             history_latents = torch.cat(
                 (history_latents, update_latents),
@@ -497,9 +412,9 @@ def gim_trajectory_training_step(
         if backward is None:
             losses.append(loss)
         else:
-            # Backprop each query block immediately so two 81-frame LingBot
-            # graphs never coexist. Scaling keeps the scene objective equal
-            # to the mean over blocks.
+            # Backprop each query block immediately so two target-chunk
+            # LingBot graphs never coexist. Scaling keeps the scene objective
+            # equal to the mean over blocks.
             backward(loss / len(batch.query_blocks))
             losses.append(loss.detach())
         flow_losses.append(flow_loss.detach())
@@ -540,6 +455,10 @@ def gim_trajectory_training_step(
         ),
         "trajectory_overlap_score": torch.tensor(
             batch.sample.trajectory_overlap_score,
+            device=device,
+        ),
+        "retrieval_coverage_score": torch.tensor(
+            batch.sample.retrieval_coverage_score,
             device=device,
         ),
     }
