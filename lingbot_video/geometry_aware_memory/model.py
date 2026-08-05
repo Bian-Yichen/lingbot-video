@@ -15,6 +15,7 @@ from .memory_encoder import (
     GIMMemoryEncoderConfig,
     TargetCameraActionEncoder,
 )
+from .profiling import ProfileTimings, synchronized_stage
 
 
 @dataclass(frozen=True)
@@ -223,30 +224,48 @@ class GIMWorldLingBotModel(nn.Module):
         query_intrinsics: torch.Tensor,
         teacher_image_hw: tuple[int, int],
         encoder_attention_mask: torch.Tensor | None = None,
+        profile_timings: ProfileTimings | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Joint paper training path, kept in one forward for DDP/FSDP."""
 
-        memory = self.build_memory(
-            history_latents,
-            history_c2w,
-            history_intrinsics,
-        )
-        actions = self.target_action_embeddings(
-            target_c2w,
-            target_intrinsics,
-        )
-        prediction = self.denoise(
-            noisy_latents,
-            timestep,
-            encoder_hidden_states,
-            memory=memory,
-            target_action_embeddings=actions,
-            encoder_attention_mask=encoder_attention_mask,
-        )
-        geometry = self.geometry_prediction(
-            memory,
-            query_c2w,
-            query_intrinsics,
-            teacher_image_hw=teacher_image_hw,
-        )
+        device = noisy_latents.device
+        with synchronized_stage(
+            profile_timings,
+            "memory_encoder_forward",
+            device,
+        ):
+            memory = self.build_memory(
+                history_latents,
+                history_c2w,
+                history_intrinsics,
+            )
+        with synchronized_stage(
+            profile_timings,
+            "camera_action_forward",
+            device,
+        ):
+            actions = self.target_action_embeddings(
+                target_c2w,
+                target_intrinsics,
+            )
+        with synchronized_stage(profile_timings, "dit_forward", device):
+            prediction = self.denoise(
+                noisy_latents,
+                timestep,
+                encoder_hidden_states,
+                memory=memory,
+                target_action_embeddings=actions,
+                encoder_attention_mask=encoder_attention_mask,
+            )
+        with synchronized_stage(
+            profile_timings,
+            "geometry_head_forward",
+            device,
+        ):
+            geometry = self.geometry_prediction(
+                memory,
+                query_c2w,
+                query_intrinsics,
+                teacher_image_hw=teacher_image_hw,
+            )
         return prediction, geometry, memory
