@@ -39,6 +39,7 @@ from lingbot_video.geometry_aware_memory.pruning import (
 from lingbot_video.geometry_aware_memory.teacher import vggt_target_hw
 from lingbot_video.geometry_aware_memory.training import (
     _require_independent_wan_vae,
+    encode_wan_frames_independently,
 )
 from lingbot_video.transformer_lingbot_video import LingBotVideoTransformer3DModel
 from scripts.inference_geometry_aware_memory import (
@@ -165,6 +166,59 @@ def test_independent_wan_vae_validation_does_not_require_causal_state() -> None:
         encode = object()
 
     _require_independent_wan_vae(IndependentWanVAE())
+
+
+def test_independent_wan_encoding_preserves_one_latent_per_frame() -> None:
+    class FakeDistribution:
+        def __init__(self, value: torch.Tensor) -> None:
+            self.value = value
+
+        def mode(self) -> torch.Tensor:
+            return self.value
+
+    class FakeWanVAE:
+        config = SimpleNamespace(
+            patch_size=None,
+            latents_mean=[0.0, 0.0],
+            latents_std=[1.0, 1.0],
+        )
+
+        def encode(self, images: torch.Tensor) -> SimpleNamespace:
+            latents = torch.nn.functional.avg_pool3d(
+                images[:, :2],
+                kernel_size=(1, 4, 4),
+            )
+            return SimpleNamespace(
+                latent_dist=FakeDistribution(latents)
+            )
+
+    class FakeItem:
+        def read_video(
+            self,
+            indices: list[int],
+            target_hw: tuple[int, int],
+        ) -> torch.Tensor:
+            del target_hw
+            return torch.stack(
+                [
+                    torch.full((3, 8, 8), float(index) / 10.0)
+                    for index in indices
+                ],
+                dim=1,
+            )
+
+    output = encode_wan_frames_independently(
+        FakeWanVAE(),
+        FakeItem(),
+        [0, 1, 2, 3, 4],
+        (8, 8),
+        read_chunk_rgb_frames=2,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+    )
+    assert output.shape == (1, 2, 5, 2, 2)
+    assert torch.all(output[:, :, 1] > output[:, :, 0])
+    assert torch.all(output[:, :, 4] > output[:, :, 3])
 
 
 def test_sample_has_continuous_target_and_pose_retrieved_small_memory() -> None:
