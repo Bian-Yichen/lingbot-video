@@ -3,7 +3,8 @@ from __future__ import annotations
 import json
 import random
 import re
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Optional
 
@@ -165,6 +166,27 @@ def has_local_retrieval_sample_for_frame_count(
 
 
 @dataclass(frozen=True)
+class PreloadedRoomTourInputs:
+    """Worker-prepared tensors needed by one training iteration.
+
+    RGB stays uint8 while crossing the multiprocessing queue, reducing shared
+    memory and host copies by 4x compared with float32. Camera tensors are
+    already normalized to the first selected capture view.
+    """
+
+    capture_rgb_uint8: torch.Tensor
+    capture_c2w: torch.Tensor
+    capture_intrinsics: torch.Tensor
+    query_rgb_uint8_blocks: tuple[torch.Tensor, ...]
+    query_c2w_blocks: tuple[torch.Tensor, ...]
+    query_intrinsics_blocks: tuple[torch.Tensor, ...]
+    item_init_seconds: float = 0.0
+    retrieval_seconds: float = 0.0
+    rgb_read_seconds: float = 0.0
+    camera_seconds: float = 0.0
+
+
+@dataclass(frozen=True)
 class RoomTourSample:
     item_name: str
     local_root: str
@@ -177,6 +199,7 @@ class RoomTourSample:
     retrieval_coverage_score: float
     trajectory_overlap_score: float
     image_hw: tuple[int, int]
+    preloaded_inputs: Optional[PreloadedRoomTourInputs] = None
 
     @property
     def capture_start(self) -> int:
@@ -239,40 +262,66 @@ class VipeRoomTourItem:
             )
 
     def _index_rgb(self) -> dict[int, Path]:
-        output: dict[int, Path] = {}
+        """Infer the regular sparse RGB path pattern with a few stat calls.
+
+        The old implementation globbed every file below RGB/. On the mounted
+        object store, listing roughly 1000 small files costs about 20 seconds
+        per scene. Room-tour RGB is regular 000000,000005,... data, so finding
+        one valid extension is sufficient to construct every requested path.
+        Missing files still fail explicitly when decoded.
+        """
+
         rgb_root = self.root / "RGB"
-        for path in sorted(rgb_root.glob("*")):
-            if (
-                not path.is_file()
-                or path.suffix.lower() not in {".jpg", ".jpeg", ".png", ".webp"}
-            ):
-                continue
-            try:
-                source_index = int(path.stem)
-            except ValueError:
-                continue
-            if source_index % SOURCE_FRAME_STRIDE:
-                continue
-            output[source_index // SOURCE_FRAME_STRIDE] = path
-        if not output:
+        camera_indices = sorted(
+            set(self.pose_by_index) & set(self.intrinsics_by_index)
+        )
+        suffixes = (".jpg", ".jpeg", ".png", ".webp")
+        selected_suffix: str | None = None
+        for index in camera_indices:
+            stem = f"{index * SOURCE_FRAME_STRIDE:06d}"
+            for suffix in suffixes:
+                if (rgb_root / f"{stem}{suffix}").is_file():
+                    selected_suffix = suffix
+                    break
+            if selected_suffix is not None:
+                break
+        if selected_suffix is None:
             raise FileNotFoundError(
-                f"no RGB frames divisible by {SOURCE_FRAME_STRIDE} below {rgb_root}"
+                "could not infer the sparse RGB filename pattern below "
+                f"{rgb_root}; expected 000000.jpg/png style files"
             )
-        return output
+        return {
+            index: rgb_root
+            / f"{index * SOURCE_FRAME_STRIDE:06d}{selected_suffix}"
+            for index in camera_indices
+        }
 
     @property
     def source_hw(self) -> tuple[int, int]:
+        cached = getattr(self, "_source_hw_cache", None)
+        if cached is not None:
+            return cached
         if "height" in self.metadata and "width" in self.metadata:
-            return int(self.metadata["height"]), int(self.metadata["width"])
-        with Image.open(self.rgb_by_index[self.indices[0]]) as image:
-            return image.height, image.width
+            source_hw = int(self.metadata["height"]), int(self.metadata["width"])
+        else:
+            with Image.open(self.rgb_by_index[self.indices[0]]) as image:
+                source_hw = image.height, image.width
+        self._source_hw_cache = source_hw
+        return source_hw
 
-    def read_rgb(
+    def read_rgb_uint8(
         self,
         index: int,
         target_hw: tuple[int, int],
     ) -> torch.Tensor:
-        with Image.open(self.rgb_by_index[index]) as image:
+        path = self.rgb_by_index[index]
+        try:
+            image_context = Image.open(path)
+        except FileNotFoundError as error:
+            raise FileNotFoundError(
+                f"expected sparse RGB frame is missing: {path}"
+            ) from error
+        with image_context as image:
             image = image.convert("RGB")
             transform = center_resize_crop(
                 (image.height, image.width),
@@ -292,17 +341,85 @@ class VipeRoomTourItem:
                     top + transform.target_height,
                 )
             )
-            array = np.asarray(image, dtype=np.float32).copy() / 255.0
+            array = np.asarray(image, dtype=np.uint8).copy()
         return torch.from_numpy(array).permute(2, 0, 1).contiguous()
+
+    def read_rgb(
+        self,
+        index: int,
+        target_hw: tuple[int, int],
+    ) -> torch.Tensor:
+        return self.read_rgb_uint8(index, target_hw).float().div_(255.0)
+
+    def read_video_uint8(
+        self,
+        indices: list[int] | tuple[int, ...],
+        target_hw: tuple[int, int],
+    ) -> torch.Tensor:
+        return torch.stack(
+            [self.read_rgb_uint8(index, target_hw) for index in indices],
+            dim=1,
+        )
 
     def read_video(
         self,
         indices: list[int] | tuple[int, ...],
         target_hw: tuple[int, int],
     ) -> torch.Tensor:
-        return torch.stack(
-            [self.read_rgb(index, target_hw) for index in indices],
-            dim=1,
+        return self.read_video_uint8(indices, target_hw).float().div_(255.0)
+
+    def preload_sample(
+        self,
+        sample: RoomTourSample,
+        *,
+        item_init_seconds: float = 0.0,
+        retrieval_seconds: float = 0.0,
+    ) -> RoomTourSample:
+        """Read all selected inputs once inside a DataLoader worker."""
+
+        origin_index = sample.capture_start
+        camera_started_at = time.perf_counter()
+        capture_c2w, capture_k = self.cameras(
+            sample.capture_rgb_indices,
+            sample.image_hw,
+            origin_index=origin_index,
+        )
+        query_cameras = tuple(
+            self.cameras(
+                block,
+                sample.image_hw,
+                origin_index=origin_index,
+            )
+            for block in sample.query_rgb_blocks
+        )
+        camera_seconds = time.perf_counter() - camera_started_at
+
+        rgb_started_at = time.perf_counter()
+        capture_rgb = self.read_video_uint8(
+            sample.capture_rgb_indices,
+            sample.image_hw,
+        )
+        query_rgb_blocks = tuple(
+            self.read_video_uint8(block, sample.image_hw)
+            for block in sample.query_rgb_blocks
+        )
+        rgb_read_seconds = time.perf_counter() - rgb_started_at
+        return replace(
+            sample,
+            preloaded_inputs=PreloadedRoomTourInputs(
+                capture_rgb_uint8=capture_rgb,
+                capture_c2w=capture_c2w,
+                capture_intrinsics=capture_k,
+                query_rgb_uint8_blocks=query_rgb_blocks,
+                query_c2w_blocks=tuple(value[0] for value in query_cameras),
+                query_intrinsics_blocks=tuple(
+                    value[1] for value in query_cameras
+                ),
+                item_init_seconds=float(item_init_seconds),
+                retrieval_seconds=float(retrieval_seconds),
+                rgb_read_seconds=float(rgb_read_seconds),
+                camera_seconds=float(camera_seconds),
+            ),
         )
 
     def cameras(
@@ -558,6 +675,7 @@ class LocalVipeRoomTourDataset(Dataset[RoomTourSample]):
         *,
         item_list: Optional[list[str]] = None,
         seed: int = 42,
+        preload_training_inputs: bool = False,
     ) -> None:
         super().__init__()
         self.item_index = LocalRoomTourIndex(dataset_root)
@@ -580,6 +698,7 @@ class LocalVipeRoomTourDataset(Dataset[RoomTourSample]):
         self._active_ordinals: list[int] = []
         self.skipped_items: tuple[str, ...] = ()
         self.seed = int(seed)
+        self.preload_training_inputs = bool(preload_training_inputs)
         self.epoch = -1
         self.set_epoch(0)
 
@@ -631,12 +750,24 @@ class LocalVipeRoomTourDataset(Dataset[RoomTourSample]):
         active_index = int(index)
         item_name = self.items[active_index]
         stable_ordinal = self._active_ordinals[active_index]
+        item_started_at = time.perf_counter()
         item = VipeRoomTourItem(self.item_index.item_path(item_name))
+        item_init_seconds = time.perf_counter() - item_started_at
         rng = random.Random(
             self.seed + 1_000_003 * self.epoch + 10_007 * stable_ordinal
         )
-        return item.make_sample(
+        retrieval_started_at = time.perf_counter()
+        sample = item.make_sample(
             self.sample_config,
             rng,
             epoch=self.epoch,
         )
+        retrieval_seconds = time.perf_counter() - retrieval_started_at
+        if not self.preload_training_inputs:
+            return sample
+        return item.preload_sample(
+            sample,
+            item_init_seconds=item_init_seconds,
+            retrieval_seconds=retrieval_seconds,
+        )
+
