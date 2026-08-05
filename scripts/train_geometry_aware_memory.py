@@ -39,6 +39,11 @@ from lingbot_video.geometry_aware_memory.pruning import (  # noqa: E402
     MIGreedyPruner,
     PoseTimeKernelConfig,
 )
+from lingbot_video.geometry_aware_memory.profiling import (  # noqa: E402
+    ProfileTimings,
+    synchronize_device,
+    synchronized_stage,
+)
 from lingbot_video.geometry_aware_memory.teacher import (  # noqa: E402
     VGGTGeometryTeacher,
     VGGTTeacherConfig,
@@ -167,6 +172,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--log_every", type=int, default=10)
     parser.add_argument("--checkpoint_every_epochs", type=int, default=1)
+    parser.add_argument(
+        "--profile_stages",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Synchronize CUDA around every pipeline stage and print per-rank "
+            "timings. Diagnostic only: synchronization slows training."
+        ),
+    )
     parser.add_argument(
         "--save_optimizer_state",
         action=argparse.BooleanOptionalAction,
@@ -379,8 +393,9 @@ def _scene_record(
     global_step: int,
     did_optimizer_step: bool,
     elapsed_seconds: float,
+    profile_timings: ProfileTimings | None = None,
 ) -> dict[str, Any]:
-    return {
+    record = {
         "rank": accelerator.process_index,
         "epoch": epoch + 1,
         "num_epochs": num_epochs,
@@ -418,6 +433,11 @@ def _scene_record(
         "overlap_score": sample.trajectory_overlap_score,
         "elapsed_seconds": elapsed_seconds,
     }
+    if profile_timings is not None:
+        record["profile_timings"] = {
+            key: float(value) for key, value in profile_timings.items()
+        }
+    return record
 
 
 def _log_scene_record(record: dict[str, Any]) -> None:
@@ -455,6 +475,115 @@ def _log_scene_record(record: dict[str, Any]) -> None:
         record["history_candidates"],
         record["memory_norm"],
         record["elapsed_seconds"],
+    )
+
+
+def _log_profile_record(record: dict[str, Any]) -> None:
+    timings = record.get("profile_timings")
+    if not timings:
+        return
+
+    def total(*names: str) -> float:
+        return sum(float(timings.get(name, 0.0)) for name in names)
+
+    iteration_total = total("dataloader_wait", "scene_total")
+    vae_total = total("memory_vae_forward", "target_vae_forward")
+    rgb_io_total = total(
+        "memory_rgb_read",
+        "target_rgb_read",
+        "geometry_rgb_read",
+    )
+    forward_total = total(
+        "memory_encoder_forward",
+        "camera_action_forward",
+        "dit_forward",
+        "geometry_head_forward",
+    )
+    optimizer_total = total("grad_clip", "optimizer_step", "zero_grad")
+    leaf_names = (
+        "dataloader_wait",
+        "scene_index_init",
+        "memory_rgb_read",
+        "memory_h2d_preprocess",
+        "memory_vae_forward",
+        "memory_latent_d2h",
+        "memory_camera_metadata",
+        "target_rgb_read",
+        "target_h2d_preprocess",
+        "target_vae_forward",
+        "target_latent_d2h",
+        "target_camera_metadata",
+        "geometry_rgb_read",
+        "history_prune_transfer",
+        "flow_setup",
+        "vggt_forward",
+        "memory_encoder_forward",
+        "camera_action_forward",
+        "dit_forward",
+        "geometry_head_forward",
+        "loss_forward",
+        "dynamic_memory_update",
+        "backward",
+        "grad_clip",
+        "optimizer_step",
+        "zero_grad",
+    )
+    attributed = total(*leaf_names)
+    other = max(iteration_total - attributed, 0.0)
+
+    def stage(value: float) -> str:
+        percent = 100.0 * value / max(iteration_total, 1e-12)
+        return f"{value:.3f}s({percent:.1f}%)"
+
+    prefix = (
+        f"epoch={record['epoch']}/{record['num_epochs']} "
+        f"iter={record['iteration']}/{record['iterations']} "
+        f"rank={record['rank']} item={record['item']}"
+    )
+    logger.info(
+        "PROFILE_MAIN %s total=%s data_wait=%s rgb_io=%s vae=%s "
+        "vggt=%s gim_memory=%s camera_action=%s dit=%s geometry_head=%s "
+        "loss=%s backward=%s optimizer=%s other=%s",
+        prefix,
+        stage(iteration_total),
+        stage(total("dataloader_wait")),
+        stage(rgb_io_total),
+        stage(vae_total),
+        stage(total("vggt_forward")),
+        stage(total("memory_encoder_forward")),
+        stage(total("camera_action_forward")),
+        stage(total("dit_forward")),
+        stage(total("geometry_head_forward")),
+        stage(total("loss_forward")),
+        stage(total("backward")),
+        stage(optimizer_total),
+        stage(other),
+    )
+    logger.info(
+        "PROFILE_DETAIL %s scene=%s index=%s prune_h2d=%s flow_setup=%s "
+        "memory[read=%s h2d=%s vae=%s d2h=%s camera=%s] "
+        "target[read=%s h2d=%s vae=%s d2h=%s camera=%s] "
+        "geometry_rgb=%s forward_total=%s grad_clip=%s step=%s zero_grad=%s",
+        prefix,
+        stage(total("scene_total")),
+        stage(total("scene_index_init")),
+        stage(total("history_prune_transfer")),
+        stage(total("flow_setup")),
+        stage(total("memory_rgb_read")),
+        stage(total("memory_h2d_preprocess")),
+        stage(total("memory_vae_forward")),
+        stage(total("memory_latent_d2h")),
+        stage(total("memory_camera_metadata")),
+        stage(total("target_rgb_read")),
+        stage(total("target_h2d_preprocess")),
+        stage(total("target_vae_forward")),
+        stage(total("target_latent_d2h")),
+        stage(total("target_camera_metadata")),
+        stage(total("geometry_rgb_read")),
+        stage(forward_total),
+        stage(total("grad_clip")),
+        stage(total("optimizer_step")),
+        stage(total("zero_grad")),
     )
 
 
@@ -756,6 +885,7 @@ def main() -> None:
             "every_iteration_all_ranks_gathered_to_main_process"
         ),
         "tensorboard_metric_reduction": "mean_across_distributed_ranks",
+        "profile_stages": args.profile_stages,
         "learning_rate": args.learning_rate,
         "num_train_epochs": args.num_train_epochs,
     }
@@ -778,6 +908,12 @@ def main() -> None:
                 "Distributed dataloader may pad at most world_size-1 scenes "
                 "when the dataset size is not divisible by world size. "
                 "Single-GPU training visits every scene exactly once/epoch."
+            )
+        if args.profile_stages:
+            logger.warning(
+                "STAGE PROFILING ENABLED: every timing boundary calls "
+                "torch.cuda.synchronize(). Timings are diagnostic and "
+                "training throughput will be lower than the formal branch."
             )
     accelerator.init_trackers(
         "gim_world_geometry_memory",
@@ -851,7 +987,19 @@ def main() -> None:
                 update_probability,
             )
 
-        for scene_step, sample in enumerate(dataloader):
+        dataloader_iterator = iter(dataloader)
+        for scene_step in range(len(dataloader)):
+            profile_timings: ProfileTimings | None = (
+                {} if args.profile_stages else None
+            )
+            with synchronized_stage(
+                profile_timings,
+                "dataloader_wait",
+                accelerator.device,
+            ):
+                sample = next(dataloader_iterator)
+            if profile_timings is not None:
+                synchronize_device(accelerator.device)
             scene_started_at = time.perf_counter()
             # Both capture and every target block are freshly read and encoded.
             # The online VAE work intentionally happens once per scene sample.
@@ -863,6 +1011,7 @@ def main() -> None:
                 ),
                 device=accelerator.device,
                 compute_dtype=_dtype(args.mixed_precision),
+                profile_timings=profile_timings,
             )
             accumulation_offset = (
                 scene_step % args.gradient_accumulation_steps
@@ -895,14 +1044,36 @@ def main() -> None:
                     device=accelerator.device,
                     compute_dtype=_dtype(args.mixed_precision),
                     backward=backward_scene,
+                    profile_timings=profile_timings,
                 )
                 if accelerator.sync_gradients:
-                    accelerator.clip_grad_norm_(
-                        model.parameters(),
-                        args.max_grad_norm,
-                    )
-                optimizer.step()
-                optimizer.zero_grad(set_to_none=True)
+                    with synchronized_stage(
+                        profile_timings,
+                        "grad_clip",
+                        accelerator.device,
+                    ):
+                        accelerator.clip_grad_norm_(
+                            model.parameters(),
+                            args.max_grad_norm,
+                        )
+                with synchronized_stage(
+                    profile_timings,
+                    "optimizer_step",
+                    accelerator.device,
+                ):
+                    optimizer.step()
+                with synchronized_stage(
+                    profile_timings,
+                    "zero_grad",
+                    accelerator.device,
+                ):
+                    optimizer.zero_grad(set_to_none=True)
+
+            if profile_timings is not None:
+                synchronize_device(accelerator.device)
+                profile_timings["scene_total"] = (
+                    time.perf_counter() - scene_started_at
+                )
 
             did_optimizer_step = bool(accelerator.sync_gradients)
             if did_optimizer_step:
@@ -921,11 +1092,13 @@ def main() -> None:
                 global_step=global_step,
                 did_optimizer_step=did_optimizer_step,
                 elapsed_seconds=time.perf_counter() - scene_started_at,
+                profile_timings=profile_timings,
             )
             gathered_records = _gather_scene_records(record, accelerator)
             if accelerator.is_main_process:
                 for gathered_record in gathered_records:
                     _log_scene_record(gathered_record)
+                    _log_profile_record(gathered_record)
 
             if not did_optimizer_step:
                 continue
