@@ -42,7 +42,7 @@ from lingbot_video.geometry_aware_memory.pruning import (  # noqa: E402
     PoseTimeKernelConfig,
 )
 from lingbot_video.geometry_aware_memory.training import (  # noqa: E402
-    encode_wan_scene_streaming,
+    encode_wan_frames_independently,
 )
 from lingbot_video.pipeline_lingbot_video import (  # noqa: E402
     DEFAULT_NEGATIVE_PROMPT,
@@ -72,7 +72,8 @@ def _config_defaults() -> dict[str, Any]:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Roll out a withheld query phase from one sparse capture window."
+            "Generate a continuous target trajectory from pose-retrieved "
+            "local memory views."
         )
     )
     parser.add_argument("--config", required=True)
@@ -81,10 +82,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dataset_root", default=None)
     parser.add_argument("--item_name", default=None)
     parser.add_argument("--output_dir", default=None)
-    parser.add_argument("--capture_start", type=int, default=None)
-    parser.add_argument("--query_start", type=int, default=None)
-    parser.add_argument("--capture_rgb_frames", type=int, default=None)
-    parser.add_argument("--capture_frame_stride", type=int, default=None)
+    parser.add_argument("--local_window_start", type=int, default=None)
+    parser.add_argument("--target_start", type=int, default=None)
+    parser.add_argument("--memory_view_count", type=int, default=None)
     parser.add_argument("--sample_epoch", type=int, default=None)
     parser.add_argument("--prompt", default=None)
     parser.add_argument("--negative_prompt", default=DEFAULT_NEGATIVE_PROMPT)
@@ -118,17 +118,16 @@ def parse_args() -> argparse.Namespace:
     if args.num_blocks < 1:
         parser.error("--num_blocks must be positive")
     explicit = (
-        args.capture_start,
-        args.query_start,
-        args.capture_rgb_frames,
-        args.capture_frame_stride,
+        args.local_window_start,
+        args.target_start,
+        args.memory_view_count,
     )
     if any(value is not None for value in explicit) and not all(
         value is not None for value in explicit
     ):
         parser.error(
-            "explicit sampling requires --capture_start, --query_start, "
-            "--capture_rgb_frames, and --capture_frame_stride together"
+            "explicit sampling requires --local_window_start, "
+            "--target_start, and --memory_view_count together"
         )
     if args.negative_prompt is None:
         args.negative_prompt = DEFAULT_NEGATIVE_PROMPT
@@ -185,6 +184,33 @@ def _save_indexed_video(
                 .numpy()
             )
             writer.append_data(frame)
+
+
+@torch.no_grad()
+def _decode_wan_frames_independently(
+    pipe: LingBotVideoPipeline,
+    latents: torch.Tensor,
+    *,
+    chunk_frames: int,
+) -> np.ndarray:
+    """Decode [1,C,T,H,W] as T unrelated one-frame VAE samples."""
+
+    if latents.shape[0] != 1:
+        raise ValueError("independent inference decoding currently expects B=1")
+    if chunk_frames < 1:
+        raise ValueError("chunk_frames must be positive")
+    flat = latents.permute(0, 2, 1, 3, 4).reshape(
+        latents.shape[2],
+        latents.shape[1],
+        1,
+        latents.shape[3],
+        latents.shape[4],
+    )
+    frames: list[np.ndarray] = []
+    for start in range(0, flat.shape[0], chunk_frames):
+        decoded = pipe._decode_latents(flat[start : start + chunk_frames])
+        frames.extend(video[0] for video in decoded)
+    return np.stack(frames, axis=0)
 
 
 def _load_checkpoint(path: Path) -> dict[str, Any]:
@@ -245,12 +271,11 @@ def main() -> None:
     logger.info("loading checkpoint %s", checkpoint_path)
     checkpoint = _load_checkpoint(checkpoint_path)
     training_config = checkpoint.get("training_config", {})
-    if "capture_window_min_rgb_frames" not in training_config:
+    if training_config.get("vae_frame_mode") != "independent":
         raise ValueError(
-            "checkpoint was trained with the previous extrapolative sampler; "
-            "it is not data-compatible with interleaved capture/query "
-            "inference. Retrain from this branch or run the checkpoint from "
-            "the earlier commit."
+            "checkpoint was not trained with independent one-frame VAE "
+            "latents and the local retrieval sampler; use the inference code "
+            "from that checkpoint's training commit"
         )
     model_dir = args.model_dir or training_config.get("model_dir")
     if not model_dir:
@@ -339,47 +364,23 @@ def main() -> None:
         height=model_config.image_height,
         width=model_config.image_width,
         target_rgb_frames=int(
-            training_config.get("target_rgb_frames", 49)
+            training_config.get("target_rgb_frames", 41)
         ),
         query_blocks=args.num_blocks,
-        vae_temporal_stride=int(
-            training_config.get("vae_temporal_stride", 4)
+        local_window_rgb_frames=int(
+            training_config.get("local_window_rgb_frames", 81)
         ),
-        capture_window_min_rgb_frames=int(
-            training_config.get("capture_window_min_rgb_frames", 257)
+        memory_views_min=int(
+            training_config.get("memory_views_min", 2)
         ),
-        capture_window_max_rgb_frames=int(
-            training_config.get("capture_window_max_rgb_frames", 1000)
+        memory_views_max=int(
+            training_config.get("memory_views_max", 24)
         ),
-        capture_window_curriculum_start_max_rgb_frames=int(
-            training_config.get(
-                "capture_window_curriculum_start_max_rgb_frames",
-                321,
-            )
+        retrieval_rotation_weight=float(
+            training_config.get("retrieval_rotation_weight", 0.25)
         ),
-        capture_window_curriculum_epochs=int(
-            training_config.get(
-                "capture_window_curriculum_epochs",
-                5,
-            )
-        ),
-        capture_window_min_fraction_of_current_max=float(
-            training_config.get(
-                "capture_window_min_fraction_of_current_max",
-                0.75,
-            )
-        ),
-        capture_frame_stride_min=int(
-            training_config.get("capture_frame_stride_min", 2)
-        ),
-        capture_frame_stride_max=int(
-            training_config.get("capture_frame_stride_max", 3)
-        ),
-        trajectory_pose_stride=int(
-            training_config.get("trajectory_pose_stride", 4)
-        ),
-        trajectory_rotation_weight=float(
-            training_config.get("trajectory_rotation_weight", 0.25)
+        retrieval_temperature=float(
+            training_config.get("retrieval_temperature", 0.25)
         ),
     )
     sample_config.validate()
@@ -391,24 +392,23 @@ def main() -> None:
         sample_config,
         random.Random(args.seed),
         epoch=sample_epoch,
-        capture_start=args.capture_start,
-        query_start=args.query_start,
-        capture_rgb_frames=args.capture_rgb_frames,
-        capture_frame_stride=args.capture_frame_stride,
+        local_window_start=args.local_window_start,
+        target_start=args.target_start,
+        memory_view_count=args.memory_view_count,
     )
     logger.info(
-        "scene=%s sample_epoch=%d window=%d:%d stride=%d capture=%d RGB "
-        "query=%d:%d (%d blocks) "
-        "coverage_score=%.4f",
+        "scene=%s sample_epoch=%d window=%d:%d memory_views=%d "
+        "target=%d:%d (%d blocks) retrieval_coverage=%.4f "
+        "pose_cost=%.4f",
         args.item_name,
         sample_epoch,
-        sample.capture_window_start,
-        sample.capture_window_end,
-        sample.capture_frame_stride,
+        sample.local_window_start,
+        sample.local_window_end,
         len(sample.capture_rgb_indices),
         sample.query_start,
         sample.query_rgb_blocks[-1][-1],
         args.num_blocks,
+        sample.retrieval_coverage_score,
         sample.trajectory_overlap_score,
     )
 
@@ -418,21 +418,18 @@ def main() -> None:
         "encoding %d capture RGB frames with the online Wan VAE",
         len(sample.capture_rgb_indices),
     )
-    capture_latents = encode_wan_scene_streaming(
+    capture_latents = encode_wan_frames_independently(
         pipe.vae,
         item,
         sample.capture_rgb_indices,
         sample.image_hw,
-        temporal_stride=sample_config.vae_temporal_stride,
         read_chunk_rgb_frames=int(
-            training_config.get("vae_encode_chunk_rgb_frames", 81)
+            training_config.get("vae_encode_chunk_rgb_frames", 4)
         ),
         device=device,
         dtype=compute_dtype,
     )
-    capture_latent_indices = sample.capture_rgb_indices[
-        :: sample_config.vae_temporal_stride
-    ]
+    capture_latent_indices = sample.capture_rgb_indices
     capture_c2w, capture_intrinsics = item.cameras(
         capture_latent_indices,
         sample.image_hw,
@@ -504,9 +501,7 @@ def main() -> None:
         for block_index, block_rgb_indices in enumerate(
             sample.query_rgb_blocks
         ):
-            block_latent_indices = block_rgb_indices[
-                :: sample_config.vae_temporal_stride
-            ]
+            block_latent_indices = block_rgb_indices
             target_c2w, target_intrinsics = item.cameras(
                 block_latent_indices,
                 sample.image_hw,
@@ -583,19 +578,12 @@ def main() -> None:
                 )[0]
 
             retained_times = history_state.times[retained_positions].tolist()
-            next_time = (
-                int(history_state.times.max().item())
-                + sample.capture_frame_stride
-                * sample_config.vae_temporal_stride
-            )
-            update_times = (
-                torch.arange(
-                    latents.shape[2],
-                    dtype=history_state.times.dtype,
-                )
-                * sample.capture_frame_stride
-                * sample_config.vae_temporal_stride
-                + next_time
+            update_times = torch.tensor(
+                [
+                    int(index) - sample.capture_start
+                    for index in block_latent_indices
+                ],
+                dtype=history_state.times.dtype,
             )
             history_state.append(
                 latents.detach().cpu().to(capture_latents.dtype),
@@ -604,7 +592,13 @@ def main() -> None:
                 update_times,
             )
 
-            generated = pipe._decode_latents(latents)[0]
+            generated = _decode_wan_frames_independently(
+                pipe,
+                latents,
+                chunk_frames=int(
+                    training_config.get("vae_encode_chunk_rgb_frames", 4)
+                ),
+            )
             ground_truth = (
                 item.read_video(block_rgb_indices, sample.image_hw)
                 .permute(1, 2, 3, 0)
@@ -665,12 +659,11 @@ def main() -> None:
         "checkpoint": str(checkpoint_path),
         "item_name": args.item_name,
         "dataset_root": args.dataset_root,
-        "capture_window_internal_range": [
-            sample.capture_window_start,
-            sample.capture_window_end,
+        "local_window_internal_range": [
+            sample.local_window_start,
+            sample.local_window_end,
         ],
-        "capture_frame_stride": sample.capture_frame_stride,
-        "query_phase_offset": sample.query_phase_offset,
+        "memory_view_count": len(sample.capture_rgb_indices),
         "capture_rgb_indices": list(sample.capture_rgb_indices),
         "capture_source_rgb_indices": [
             int(index) * SOURCE_FRAME_STRIDE
@@ -694,6 +687,7 @@ def main() -> None:
         "checkpoint_next_epoch": int(checkpoint.get("next_epoch", 0)),
         "checkpoint_global_step": int(checkpoint.get("global_step", 0)),
         "trajectory_overlap_score": sample.trajectory_overlap_score,
+        "retrieval_coverage_score": sample.retrieval_coverage_score,
         "initial_capture_latent_frames": capture_latents.shape[2],
         "updated_history_latent_frames": history_state.frame_count,
         "num_blocks": args.num_blocks,
@@ -705,7 +699,8 @@ def main() -> None:
         "resolution": list(sample.image_hw),
         "mixed_precision": args.mixed_precision,
         "save_capture_video": args.save_capture_video,
-        "cache_mode": "disabled; capture VAE runs online from RGB",
+        "vae_frame_mode": "independent one-frame encode/decode",
+        "cache_mode": "disabled; memory-view VAE runs online from RGB",
         "query_input_note": (
             "Only query camera poses/intrinsics enter generation. Query RGB is "
             "read after generation for ground-truth evaluation only."
