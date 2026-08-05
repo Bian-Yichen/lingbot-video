@@ -221,6 +221,51 @@ def test_independent_wan_encoding_preserves_one_latent_per_frame() -> None:
     assert torch.all(output[:, :, 4] > output[:, :, 3])
 
 
+def test_independent_wan_encoding_accepts_worker_preloaded_uint8() -> None:
+    class FakeDistribution:
+        def __init__(self, value: torch.Tensor) -> None:
+            self.value = value
+
+        def mode(self) -> torch.Tensor:
+            return self.value
+
+    class FakeWanVAE:
+        config = SimpleNamespace(
+            patch_size=None,
+            latents_mean=[0.0, 0.0],
+            latents_std=[1.0, 1.0],
+        )
+
+        def encode(self, images: torch.Tensor) -> SimpleNamespace:
+            return SimpleNamespace(
+                latent_dist=FakeDistribution(
+                    torch.nn.functional.avg_pool3d(
+                        images[:, :2],
+                        kernel_size=(1, 4, 4),
+                    )
+                )
+            )
+
+    video = torch.stack(
+        [torch.full((3, 8, 8), index * 32, dtype=torch.uint8)
+         for index in range(5)],
+        dim=1,
+    )
+    output = encode_wan_frames_independently(
+        FakeWanVAE(),
+        None,
+        [0, 1, 2, 3, 4],
+        (8, 8),
+        read_chunk_rgb_frames=2,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+        preloaded_video=video,
+    )
+    assert output.shape == (1, 2, 5, 2, 2)
+    assert torch.all(output[:, :, 1] > output[:, :, 0])
+    assert torch.all(output[:, :, 4] > output[:, :, 3])
+
+
 def test_sample_has_continuous_target_and_pose_retrieved_small_memory() -> None:
     item = VipeRoomTourItem.__new__(VipeRoomTourItem)
     item.root = Path("/fake/scene.mp4")
