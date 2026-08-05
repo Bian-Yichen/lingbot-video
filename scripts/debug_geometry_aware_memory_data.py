@@ -33,42 +33,24 @@ def _config_defaults() -> dict[str, Any]:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Audit one interleaved sparse-capture/query sample."
+        description="Audit one local target and retrieved-memory sample."
     )
     parser.add_argument("--config", required=True)
     parser.add_argument("--item_name", default=None)
     parser.add_argument("--dataset_root", default=None)
     parser.add_argument("--height", type=int, default=480)
     parser.add_argument("--width", type=int, default=832)
-    parser.add_argument("--target_rgb_frames", type=int, default=49)
+    parser.add_argument("--target_rgb_frames", type=int, default=41)
     parser.add_argument("--query_blocks", type=int, default=1)
-    parser.add_argument("--vae_temporal_stride", type=int, default=4)
-    parser.add_argument("--capture_window_min_rgb_frames", type=int, default=257)
-    parser.add_argument("--capture_window_max_rgb_frames", type=int, default=1000)
-    parser.add_argument(
-        "--capture_window_curriculum_start_max_rgb_frames",
-        type=int,
-        default=321,
-    )
-    parser.add_argument(
-        "--capture_window_curriculum_epochs",
-        type=int,
-        default=5,
-    )
-    parser.add_argument(
-        "--capture_window_min_fraction_of_current_max",
-        type=float,
-        default=0.75,
-    )
-    parser.add_argument("--capture_frame_stride_min", type=int, default=2)
-    parser.add_argument("--capture_frame_stride_max", type=int, default=3)
-    parser.add_argument("--trajectory_pose_stride", type=int, default=4)
-    parser.add_argument("--trajectory_rotation_weight", type=float, default=0.25)
+    parser.add_argument("--local_window_rgb_frames", type=int, default=81)
+    parser.add_argument("--memory_views_min", type=int, default=2)
+    parser.add_argument("--memory_views_max", type=int, default=24)
+    parser.add_argument("--retrieval_rotation_weight", type=float, default=0.25)
+    parser.add_argument("--retrieval_temperature", type=float, default=0.25)
     parser.add_argument("--sample_epoch", type=int, default=0)
-    parser.add_argument("--capture_start", type=int, default=None)
-    parser.add_argument("--query_start", type=int, default=None)
-    parser.add_argument("--capture_rgb_frames", type=int, default=None)
-    parser.add_argument("--capture_frame_stride", type=int, default=None)
+    parser.add_argument("--local_window_start", type=int, default=None)
+    parser.add_argument("--target_start", type=int, default=None)
+    parser.add_argument("--memory_view_count", type=int, default=None)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
         "--break_after_resolve",
@@ -87,17 +69,16 @@ def parse_args() -> argparse.Namespace:
     if not args.dataset_root:
         parser.error("--dataset_root is required (it may be supplied by --config)")
     explicit = (
-        args.capture_start,
-        args.query_start,
-        args.capture_rgb_frames,
-        args.capture_frame_stride,
+        args.local_window_start,
+        args.target_start,
+        args.memory_view_count,
     )
     if any(value is not None for value in explicit) and not all(
         value is not None for value in explicit
     ):
         parser.error(
-            "explicit sampling requires capture_start, query_start, "
-            "capture_rgb_frames, and capture_frame_stride"
+            "explicit sampling requires local_window_start, target_start, "
+            "and memory_view_count"
         )
     return args
 
@@ -118,31 +99,19 @@ def main() -> None:
         width=args.width,
         target_rgb_frames=args.target_rgb_frames,
         query_blocks=args.query_blocks,
-        vae_temporal_stride=args.vae_temporal_stride,
-        capture_window_min_rgb_frames=args.capture_window_min_rgb_frames,
-        capture_window_max_rgb_frames=args.capture_window_max_rgb_frames,
-        capture_window_curriculum_start_max_rgb_frames=(
-            args.capture_window_curriculum_start_max_rgb_frames
-        ),
-        capture_window_curriculum_epochs=(
-            args.capture_window_curriculum_epochs
-        ),
-        capture_window_min_fraction_of_current_max=(
-            args.capture_window_min_fraction_of_current_max
-        ),
-        capture_frame_stride_min=args.capture_frame_stride_min,
-        capture_frame_stride_max=args.capture_frame_stride_max,
-        trajectory_pose_stride=args.trajectory_pose_stride,
-        trajectory_rotation_weight=args.trajectory_rotation_weight,
+        local_window_rgb_frames=args.local_window_rgb_frames,
+        memory_views_min=args.memory_views_min,
+        memory_views_max=args.memory_views_max,
+        retrieval_rotation_weight=args.retrieval_rotation_weight,
+        retrieval_temperature=args.retrieval_temperature,
     )
     sample = item.make_sample(
         config,
         random.Random(args.seed),
         epoch=args.sample_epoch,
-        capture_start=args.capture_start,
-        query_start=args.query_start,
-        capture_rgb_frames=args.capture_rgb_frames,
-        capture_frame_stride=args.capture_frame_stride,
+        local_window_start=args.local_window_start,
+        target_start=args.target_start,
+        memory_view_count=args.memory_view_count,
     )
     capture_set = set(sample.capture_rgb_indices)
     query_indices = tuple(
@@ -151,13 +120,6 @@ def main() -> None:
         for index in block
     )
     query_set = set(query_indices)
-    capture_deltas = [
-        right - left
-        for left, right in zip(
-            sample.capture_rgb_indices,
-            sample.capture_rgb_indices[1:],
-        )
-    ]
     query_deltas = [
         right - left
         for left, right in zip(query_indices, query_indices[1:])
@@ -177,35 +139,24 @@ def main() -> None:
             f"internal i corresponds to source index {SOURCE_FRAME_STRIDE}*i"
         ),
         "sample_epoch": args.sample_epoch,
-        "capture_window_curriculum_rgb_bounds": (
-            config.capture_window_bounds_for_epoch(
-                args.sample_epoch
-            )
-        ),
-        "capture_window_internal_range": [
-            sample.capture_window_start,
-            sample.capture_window_end,
+        "local_window_internal_range": [
+            sample.local_window_start,
+            sample.local_window_end,
         ],
-        "capture_window_source_range": [
-            SOURCE_FRAME_STRIDE * sample.capture_window_start,
-            SOURCE_FRAME_STRIDE * sample.capture_window_end,
+        "local_window_source_range": [
+            SOURCE_FRAME_STRIDE * sample.local_window_start,
+            SOURCE_FRAME_STRIDE * sample.local_window_end,
         ],
-        "capture_window_rgb_frames": (
-            sample.capture_window_end - sample.capture_window_start + 1
+        "local_window_rgb_frames": (
+            sample.local_window_end - sample.local_window_start + 1
         ),
-        "capture_frame_stride_internal": sample.capture_frame_stride,
-        "capture_frame_stride_source_rgb": (
-            SOURCE_FRAME_STRIDE * sample.capture_frame_stride
-        ),
-        "capture_uniform_stride": (
-            set(capture_deltas) == {sample.capture_frame_stride}
-        ),
-        "capture_rgb_frames": len(sample.capture_rgb_indices),
-        "capture_latent_frames": (
-            1
-            + (len(sample.capture_rgb_indices) - 1)
-            // config.vae_temporal_stride
-        ),
+        "memory_view_internal_indices": list(sample.capture_rgb_indices),
+        "memory_view_source_indices": [
+            SOURCE_FRAME_STRIDE * index
+            for index in sample.capture_rgb_indices
+        ],
+        "memory_rgb_frames": len(sample.capture_rgb_indices),
+        "memory_latent_frames": len(sample.capture_rgb_indices),
         "query_blocks_internal_ranges": [
             [block[0], block[-1]] for block in sample.query_rgb_blocks
         ],
@@ -217,18 +168,18 @@ def main() -> None:
             for block in sample.query_rgb_blocks
         ],
         "query_rgb_frames_total": len(query_indices),
-        "query_phase_offset": sample.query_phase_offset,
-        "query_uniform_stride": (
-            set(query_deltas) == {sample.capture_frame_stride}
-        ),
+        "query_contiguous": set(query_deltas) == {1},
         "query_latent_frames_per_block": config.target_latent_frames,
         "geometry_query_internal_indices": list(
             sample.geometry_query_indices
         ),
         "capture_query_disjoint": capture_set.isdisjoint(query_set),
-        "query_inside_capture_window": (
-            query_indices[0] >= sample.capture_window_start
-            and query_indices[-1] <= sample.capture_window_end
+        "query_inside_local_window": (
+            query_indices[0] >= sample.local_window_start
+            and query_indices[-1] <= sample.local_window_end
+        ),
+        "retrieval_coverage_score_higher_is_better": (
+            sample.retrieval_coverage_score
         ),
         "trajectory_overlap_score_lower_is_better": (
             sample.trajectory_overlap_score
@@ -238,8 +189,8 @@ def main() -> None:
         ),
         "cache_mode": "disabled; VAE and VGGT run online during training",
         "iteration_semantics": (
-            "one scene once per epoch; epoch changes window, stride, phase, "
-            "and query crop"
+            "one scene once per epoch; epoch changes the local window, memory "
+            "view count, and pose-retrieval result"
         ),
     }
     print(json.dumps(report, indent=2, ensure_ascii=False))
