@@ -166,7 +166,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dataloader_workers", type=int, default=0)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--log_every", type=int, default=10)
-    parser.add_argument("--checkpoint_every_epochs", type=int, default=1)
+    parser.add_argument(
+        "--checkpoint_every_iterations",
+        type=int,
+        default=200,
+        help=(
+            "Save after this many cumulative scene iterations. If gradient "
+            "accumulation is active, saving is delayed to the next completed "
+            "optimizer step so partial gradients are never checkpointed."
+        ),
+    )
     parser.add_argument(
         "--save_optimizer_state",
         action=argparse.BooleanOptionalAction,
@@ -186,8 +195,10 @@ def parse_args() -> argparse.Namespace:
         parser.error("--num_train_epochs must be positive")
     if args.gradient_accumulation_steps < 1:
         parser.error("--gradient_accumulation_steps must be positive")
-    if args.log_every < 1 or args.checkpoint_every_epochs < 1:
-        parser.error("--log_every and --checkpoint_every_epochs must be positive")
+    if args.log_every < 1 or args.checkpoint_every_iterations < 1:
+        parser.error(
+            "--log_every and --checkpoint_every_iterations must be positive"
+        )
     if args.dataloader_workers < 0:
         parser.error("--dataloader_workers cannot be negative")
     if args.pruning_budget < 1:
@@ -376,6 +387,7 @@ def _scene_record(
     scene_steps: int,
     accumulation_position: int,
     accumulation_group_size: int,
+    global_iteration: int,
     global_step: int,
     did_optimizer_step: bool,
     elapsed_seconds: float,
@@ -387,6 +399,7 @@ def _scene_record(
         "iteration": scene_step + 1,
         "iterations": scene_steps,
         "item": sample.item_name,
+        "global_iteration": global_iteration,
         "global_step": global_step,
         "did_optimizer_step": did_optimizer_step,
         "accumulation_position": accumulation_position,
@@ -423,7 +436,7 @@ def _scene_record(
 def _log_scene_record(record: dict[str, Any]) -> None:
     logger.info(
         "scene epoch=%d/%d iter=%d/%d rank=%d item=%s "
-        "global_step=%d optimizer_step=%s accumulation=%d/%d "
+        "global_iter=%d global_step=%d optimizer_step=%s accumulation=%d/%d "
         "loss=%.6g flow_loss=%.6g geometry_loss=%.6g sigma=%.4f "
         "window=%d:%d memory_views=%d memory_latents=%.0f "
         "target=%d:%d retrieval_coverage=%.4f overlap=%.4f "
@@ -435,6 +448,7 @@ def _log_scene_record(record: dict[str, Any]) -> None:
         record["iterations"],
         record["rank"],
         record["item"],
+        record["global_iteration"],
         record["global_step"],
         "yes" if record["did_optimizer_step"] else "no",
         record["accumulation_position"],
@@ -473,7 +487,10 @@ def _checkpoint_payload(
     *,
     args: argparse.Namespace,
     step: int,
+    global_iteration: int,
     next_epoch: int,
+    next_iteration_in_epoch: int,
+    epoch_loader_generator_state: torch.Tensor | None,
 ) -> dict[str, Any]:
     trainable_names = {
         name
@@ -496,13 +513,57 @@ def _checkpoint_payload(
     payload = {
         "model": state,
         "global_step": int(step),
+        "global_iteration": int(global_iteration),
         "next_epoch": int(next_epoch),
+        "next_iteration_in_epoch": int(next_iteration_in_epoch),
         "model_config": model.gim_config.to_dict(),
         "training_config": vars(args),
     }
+    if epoch_loader_generator_state is not None:
+        payload["epoch_loader_generator_state"] = (
+            epoch_loader_generator_state.cpu()
+        )
     if args.save_optimizer_state:
         payload["optimizer"] = optimizer.state_dict()
     return payload
+
+
+def _save_checkpoint(
+    accelerator: Accelerator,
+    model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    output_dir: Path,
+    *,
+    args: argparse.Namespace,
+    global_step: int,
+    global_iteration: int,
+    next_epoch: int,
+    next_iteration_in_epoch: int,
+    epoch_loader_generator_state: torch.Tensor | None,
+) -> Path:
+    checkpoint_dir = (
+        output_dir
+        / (
+            f"checkpoint-iter-{global_iteration:08d}"
+            f"-step-{global_step:08d}"
+        )
+    )
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    payload = _checkpoint_payload(
+        accelerator.unwrap_model(model),
+        optimizer,
+        args=args,
+        step=global_step,
+        global_iteration=global_iteration,
+        next_epoch=next_epoch,
+        next_iteration_in_epoch=next_iteration_in_epoch,
+        epoch_loader_generator_state=epoch_loader_generator_state,
+    )
+    accelerator.save(
+        payload,
+        checkpoint_dir / "trainable_components.pt",
+    )
+    return checkpoint_dir
 
 
 def _scheduled_probability(args: argparse.Namespace, epoch: int) -> float:
@@ -734,6 +795,7 @@ def main() -> None:
             lora_summary.parameter_count if lora_summary is not None else 0
         ),
         "checkpoint_saves_optimizer_state": args.save_optimizer_state,
+        "checkpoint_every_iterations": args.checkpoint_every_iterations,
         "total_parameters": total_parameters,
         "trainable_parameters": trainable_parameters,
         "memory_encoder_parameters": sum(
@@ -789,7 +851,10 @@ def main() -> None:
     )
 
     global_step = 0
+    global_iteration = 0
     start_epoch = 0
+    resume_iteration_in_epoch = 0
+    resume_loader_generator_state: torch.Tensor | None = None
     if args.resume_from_checkpoint:
         checkpoint = torch.load(
             _checkpoint_file(args.resume_from_checkpoint),
@@ -807,6 +872,18 @@ def main() -> None:
         )
         global_step = int(checkpoint.get("global_step", 0))
         start_epoch = int(checkpoint.get("next_epoch", 0))
+        global_iteration = int(
+            checkpoint.get(
+                "global_iteration",
+                start_epoch * len(dataloader),
+            )
+        )
+        resume_iteration_in_epoch = int(
+            checkpoint.get("next_iteration_in_epoch", 0)
+        )
+        resume_loader_generator_state = checkpoint.get(
+            "epoch_loader_generator_state"
+        )
         if "optimizer" in checkpoint:
             optimizer.load_state_dict(checkpoint["optimizer"])
         else:
@@ -815,13 +892,22 @@ def main() -> None:
                 "a freshly initialized AdamW optimizer"
             )
         logger.info(
-            "resumed epoch=%d step=%d missing=%d unexpected=%d",
+            "resumed epoch=%d iteration_in_epoch=%d global_iter=%d "
+            "step=%d missing=%d unexpected=%d",
             start_epoch,
+            resume_iteration_in_epoch,
+            global_iteration,
             global_step,
             len(missing),
             len(unexpected),
         )
 
+    next_checkpoint_iteration = (
+        global_iteration // args.checkpoint_every_iterations + 1
+    ) * args.checkpoint_every_iterations
+    last_checkpoint_iteration = (
+        global_iteration if args.resume_from_checkpoint else -1
+    )
     model.train()
     for epoch in range(start_epoch, args.num_train_epochs):
         dataset.set_epoch(epoch)
@@ -851,7 +937,31 @@ def main() -> None:
                 update_probability,
             )
 
-        for scene_step, sample in enumerate(dataloader):
+        iteration_offset = (
+            resume_iteration_in_epoch if epoch == start_epoch else 0
+        )
+        if iteration_offset < 0 or iteration_offset > len(dataloader):
+            raise ValueError(
+                "checkpoint next_iteration_in_epoch is outside the current "
+                f"dataloader: {iteration_offset} vs {len(dataloader)}"
+            )
+        if epoch == start_epoch and resume_loader_generator_state is not None:
+            loader_generator.set_state(resume_loader_generator_state)
+        epoch_loader_generator_state = loader_generator.get_state().clone()
+        dataloader_iterator = iter(dataloader)
+        for _ in range(iteration_offset):
+            # Restore the exact shuffled position without repeating VAE/VGGT
+            # or optimization for already-completed scene iterations.
+            next(dataloader_iterator)
+        if iteration_offset and accelerator.is_main_process:
+            logger.info(
+                "resume skipped %d completed scene iterations in epoch %d",
+                iteration_offset,
+                epoch + 1,
+            )
+
+        for scene_step in range(iteration_offset, len(dataloader)):
+            sample = next(dataloader_iterator)
             scene_started_at = time.perf_counter()
             # Both capture and every target block are freshly read and encoded.
             # The online VAE work intentionally happens once per scene sample.
@@ -905,6 +1015,7 @@ def main() -> None:
                 optimizer.zero_grad(set_to_none=True)
 
             did_optimizer_step = bool(accelerator.sync_gradients)
+            global_iteration += 1
             if did_optimizer_step:
                 global_step += 1
 
@@ -918,6 +1029,7 @@ def main() -> None:
                 scene_steps=len(dataloader),
                 accumulation_position=accumulation_offset + 1,
                 accumulation_group_size=accumulation_group_size,
+                global_iteration=global_iteration,
                 global_step=global_step,
                 did_optimizer_step=did_optimizer_step,
                 elapsed_seconds=time.perf_counter() - scene_started_at,
@@ -927,59 +1039,107 @@ def main() -> None:
                 for gathered_record in gathered_records:
                     _log_scene_record(gathered_record)
 
-            if not did_optimizer_step:
-                continue
-            metrics = _distributed_mean_metrics(
-                output,
-                sample,
-                update_probability=update_probability,
-                optimizer=optimizer,
-                accelerator=accelerator,
-            )
-            metrics["train/epoch"] = float(epoch)
-            accelerator.log(metrics, step=global_step)
-            if global_step % args.log_every == 0 and accelerator.is_main_process:
-                logger.info(
-                    "optimizer step=%d epoch=%d distributed_mean %s",
-                    global_step,
-                    epoch + 1,
-                    " ".join(
-                        f"{key}={value:.6g}"
-                        for key, value in metrics.items()
-                        if key
-                        in {
-                            "train/loss",
-                            "train/flow_loss",
-                            "train/geometry_loss",
-                            "train/history_retained",
-                            "train/predicted_update_fraction",
-                        }
-                    ),
+            if did_optimizer_step:
+                metrics = _distributed_mean_metrics(
+                    output,
+                    sample,
+                    update_probability=update_probability,
+                    optimizer=optimizer,
+                    accelerator=accelerator,
                 )
+                metrics["train/epoch"] = float(epoch)
+                metrics["train/global_iteration"] = float(global_iteration)
+                accelerator.log(metrics, step=global_step)
+                if (
+                    global_step % args.log_every == 0
+                    and accelerator.is_main_process
+                ):
+                    logger.info(
+                        "optimizer step=%d global_iter=%d epoch=%d "
+                        "distributed_mean %s",
+                        global_step,
+                        global_iteration,
+                        epoch + 1,
+                        " ".join(
+                            f"{key}={value:.6g}"
+                            for key, value in metrics.items()
+                            if key
+                            in {
+                                "train/loss",
+                                "train/flow_loss",
+                                "train/geometry_loss",
+                                "train/history_retained",
+                                "train/predicted_update_fraction",
+                            }
+                        ),
+                    )
+
+            checkpoint_due = (
+                global_iteration >= next_checkpoint_iteration
+                and did_optimizer_step
+            )
+            if checkpoint_due:
+                next_iteration_in_epoch = scene_step + 1
+                if next_iteration_in_epoch >= len(dataloader):
+                    checkpoint_next_epoch = epoch + 1
+                    next_iteration_in_epoch = 0
+                    checkpoint_loader_state = None
+                else:
+                    checkpoint_next_epoch = epoch
+                    checkpoint_loader_state = epoch_loader_generator_state
+                accelerator.wait_for_everyone()
+                if accelerator.is_main_process:
+                    checkpoint_dir = _save_checkpoint(
+                        accelerator,
+                        model,
+                        optimizer,
+                        output_dir,
+                        args=args,
+                        global_step=global_step,
+                        global_iteration=global_iteration,
+                        next_epoch=checkpoint_next_epoch,
+                        next_iteration_in_epoch=next_iteration_in_epoch,
+                        epoch_loader_generator_state=checkpoint_loader_state,
+                    )
+                    logger.info(
+                        "saved %s at global_iter=%d",
+                        checkpoint_dir,
+                        global_iteration,
+                    )
+                accelerator.wait_for_everyone()
+                last_checkpoint_iteration = global_iteration
+                while next_checkpoint_iteration <= global_iteration:
+                    next_checkpoint_iteration += (
+                        args.checkpoint_every_iterations
+                    )
 
         accelerator.wait_for_everyone()
-        should_save = (
-            (epoch + 1) % args.checkpoint_every_epochs == 0
-            or epoch + 1 == args.num_train_epochs
-        )
-        if should_save and accelerator.is_main_process:
-            checkpoint_dir = (
-                output_dir
-                / f"checkpoint-epoch-{epoch + 1:04d}-step-{global_step:08d}"
-            )
-            checkpoint_dir.mkdir(parents=True, exist_ok=True)
-            payload = _checkpoint_payload(
-                accelerator.unwrap_model(model),
+        resume_iteration_in_epoch = 0
+        resume_loader_generator_state = None
+
+    # Always preserve the final weights, without duplicating a checkpoint when
+    # the last iteration already landed exactly on the requested interval.
+    if global_iteration != last_checkpoint_iteration:
+        accelerator.wait_for_everyone()
+        if accelerator.is_main_process:
+            checkpoint_dir = _save_checkpoint(
+                accelerator,
+                model,
                 optimizer,
+                output_dir,
                 args=args,
-                step=global_step,
-                next_epoch=epoch + 1,
+                global_step=global_step,
+                global_iteration=global_iteration,
+                next_epoch=args.num_train_epochs,
+                next_iteration_in_epoch=0,
+                epoch_loader_generator_state=None,
             )
-            accelerator.save(
-                payload,
-                checkpoint_dir / "trainable_components.pt",
+            logger.info(
+                "saved final %s at global_iter=%d",
+                checkpoint_dir,
+                global_iteration,
             )
-            logger.info("saved %s", checkpoint_dir)
+        accelerator.wait_for_everyone()
 
     accelerator.end_training()
 
