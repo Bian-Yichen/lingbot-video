@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import contextvars
 import time
 from collections.abc import Iterator
 
@@ -8,6 +9,9 @@ import torch
 
 
 ProfileTimings = dict[str, float]
+_ACTIVE_TIMINGS: contextvars.ContextVar[ProfileTimings | None] = (
+    contextvars.ContextVar("gim_profile_timings", default=None)
+)
 
 
 def synchronize_device(device: torch.device) -> None:
@@ -15,6 +19,17 @@ def synchronize_device(device: torch.device) -> None:
 
     if device.type == "cuda":
         torch.cuda.synchronize(device)
+
+
+@contextlib.contextmanager
+def profiling_scope(timings: ProfileTimings | None) -> Iterator[None]:
+    """Expose one rank-local timing sink through DDP's forward wrapper."""
+
+    token = _ACTIVE_TIMINGS.set(timings)
+    try:
+        yield
+    finally:
+        _ACTIVE_TIMINGS.reset(token)
 
 
 @contextlib.contextmanager
@@ -29,6 +44,9 @@ def synchronized_stage(
     temporary profiling branch and must not be used for throughput training.
     """
 
+    active_timings = _ACTIVE_TIMINGS.get()
+    if active_timings is not None:
+        timings = active_timings
     if timings is None:
         yield
         return
