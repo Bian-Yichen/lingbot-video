@@ -12,7 +12,7 @@ import lingbot_video.transformer_lingbot_video as lingbot_transformer
 from lingbot_video.geometry_aware_memory.data import (
     estimate_sparse_frame_count,
     GeometryMemorySampleConfig,
-    has_interleaved_sample_for_frame_count,
+    has_local_retrieval_sample_for_frame_count,
     LocalRoomTourIndex,
     LocalVipeRoomTourDataset,
     VipeRoomTourItem,
@@ -38,8 +38,7 @@ from lingbot_video.geometry_aware_memory.pruning import (
 )
 from lingbot_video.geometry_aware_memory.teacher import vggt_target_hw
 from lingbot_video.geometry_aware_memory.training import (
-    _require_streamable_wan_vae,
-    _reset_wan_encoder_state,
+    _require_independent_wan_vae,
 )
 from lingbot_video.transformer_lingbot_video import LingBotVideoTransformer3DModel
 from scripts.inference_geometry_aware_memory import (
@@ -103,117 +102,72 @@ def test_local_roomtour_index_uses_mounted_scene_in_place(tmp_path) -> None:
 
 
 def test_filename_frame_count_and_epoch_scene_filtering(tmp_path) -> None:
+    tiny_name = "tiny_000000_000300.mp4"
     short_name = "qv2GbEEaivI_000000_001182.mp4"
-    medium_name = "medium_000000_002500.mp4"
+    medium_name = "medium_000000_000405.mp4"
     long_name = "long_000000_005000.mp4"
-    for item_name in (short_name, medium_name, long_name):
+    for item_name in (tiny_name, short_name, medium_name, long_name):
         (tmp_path / item_name).mkdir()
+    assert estimate_sparse_frame_count(tiny_name) == 60
     assert estimate_sparse_frame_count(short_name) == 236
-    assert estimate_sparse_frame_count(medium_name) == 500
+    assert estimate_sparse_frame_count(medium_name) == 81
     assert estimate_sparse_frame_count(long_name) == 1000
 
     config = GeometryMemorySampleConfig(
-        target_rgb_frames=81,
-        capture_window_min_rgb_frames=257,
-        capture_window_curriculum_start_max_rgb_frames=321,
-        capture_window_max_rgb_frames=1000,
-        capture_window_curriculum_epochs=3,
+        target_rgb_frames=41,
+        local_window_rgb_frames=81,
+        memory_views_min=2,
+        memory_views_max=24,
     )
     dataset = LocalVipeRoomTourDataset(
         tmp_path,
         config,
-        item_list=[short_name, medium_name, long_name],
+        item_list=[tiny_name, short_name, medium_name, long_name],
     )
-    assert dataset.total_item_count == 3
-    assert dataset.items == [medium_name, long_name]
-    assert dataset.skipped_items == (short_name,)
+    assert dataset.total_item_count == 4
+    assert dataset.items == [short_name, medium_name, long_name]
+    assert dataset.skipped_items == (tiny_name,)
 
     dataset.set_epoch(2)
-    assert dataset.items == [long_name]
-    assert dataset.skipped_items == (short_name, medium_name)
+    assert dataset.items == [short_name, medium_name, long_name]
+    assert dataset.skipped_items == (tiny_name,)
 
 
 def test_frame_count_filter_includes_exact_valid_boundary() -> None:
     config = GeometryMemorySampleConfig(
-        target_rgb_frames=81,
-        capture_window_min_rgb_frames=257,
-        capture_window_curriculum_start_max_rgb_frames=321,
-        capture_window_max_rgb_frames=321,
-        capture_window_curriculum_epochs=0,
+        target_rgb_frames=41,
+        local_window_rgb_frames=81,
     )
-    assert not has_interleaved_sample_for_frame_count(256, config, 0)
-    assert has_interleaved_sample_for_frame_count(257, config, 0)
+    assert not has_local_retrieval_sample_for_frame_count(80, config)
+    assert has_local_retrieval_sample_for_frame_count(81, config)
 
 
-def test_fast_frame_count_filter_matches_exact_shape_enumeration() -> None:
-    config = GeometryMemorySampleConfig(
-        target_rgb_frames=81,
-        capture_window_min_rgb_frames=257,
-        capture_window_curriculum_start_max_rgb_frames=321,
-        capture_window_max_rgb_frames=1000,
-        capture_window_curriculum_epochs=3,
-    )
-    item = VipeRoomTourItem.__new__(VipeRoomTourItem)
-    for epoch in range(3):
-        for frame_count in (168, 169, 236, 256, 257, 321, 500, 750, 1000):
-            item.indices = list(range(frame_count))
-            assert has_interleaved_sample_for_frame_count(
-                frame_count,
-                config,
-                epoch,
-            ) == bool(item._valid_capture_shapes(config, epoch))
-
-
-def test_trajectory_lengths_must_match_causal_vae_stride() -> None:
-    with pytest.raises(ValueError, match="target_rgb_frames"):
+def test_local_retrieval_config_requires_non_target_candidates() -> None:
+    with pytest.raises(ValueError, match="local_window_rgb_frames"):
         GeometryMemorySampleConfig(
-            target_rgb_frames=80,
+            target_rgb_frames=41,
+            local_window_rgb_frames=42,
         ).validate()
-    with pytest.raises(ValueError, match="capture_frame_stride_min"):
+    with pytest.raises(ValueError, match="memory_views_max"):
         GeometryMemorySampleConfig(
-            capture_frame_stride_min=1,
+            target_rgb_frames=41,
+            local_window_rgb_frames=50,
+            memory_views_max=10,
         ).validate()
 
 
-def test_wan_streaming_state_is_initialized_lazily() -> None:
-    class LazyWanVAE:
+def test_independent_wan_vae_validation_does_not_require_causal_state() -> None:
+    class IndependentWanVAE:
         config = SimpleNamespace(
             scale_factor_temporal=4,
             patch_size=None,
         )
-        encoder = object()
-        quant_conv = object()
+        encode = object()
 
-        def clear_cache(self) -> None:
-            self._enc_feat_map = [None, None]
-            self._enc_conv_idx = [0]
-
-    vae = LazyWanVAE()
-    assert not hasattr(vae, "_enc_feat_map")
-    assert not hasattr(vae, "_enc_conv_idx")
-    _require_streamable_wan_vae(vae, temporal_stride=4)
-    _reset_wan_encoder_state(vae)
-    assert vae._enc_feat_map == [None, None]
-    assert vae._enc_conv_idx == [0]
+    _require_independent_wan_vae(IndependentWanVAE())
 
 
-def test_capture_curriculum_reaches_full_length() -> None:
-    config = GeometryMemorySampleConfig(
-        capture_window_min_rgb_frames=257,
-        capture_window_curriculum_start_max_rgb_frames=321,
-        capture_window_max_rgb_frames=1000,
-        capture_window_curriculum_epochs=5,
-    )
-    assert config.capture_window_max_for_epoch(0) == 321
-    assert config.capture_window_max_for_epoch(2) == 660
-    assert config.capture_window_max_for_epoch(4) == 1000
-    assert config.capture_window_max_for_epoch(99) == 1000
-    assert config.capture_window_bounds_for_epoch(0) == (257, 321)
-    assert config.capture_window_bounds_for_epoch(2) == (495, 660)
-    assert config.capture_window_bounds_for_epoch(4) == (750, 1000)
-
-
-def test_sample_is_interleaved_uniform_disjoint_capture_and_query() -> None:
+def test_sample_has_continuous_target_and_pose_retrieved_small_memory() -> None:
     item = VipeRoomTourItem.__new__(VipeRoomTourItem)
     item.root = Path("/fake/scene.mp4")
     item.indices = list(range(1000))
@@ -225,14 +179,11 @@ def test_sample_is_interleaved_uniform_disjoint_capture_and_query() -> None:
         pose[2, 3] = index / 1000.0
         item.pose_by_index[index] = pose
     config = GeometryMemorySampleConfig(
-        target_rgb_frames=49,
+        target_rgb_frames=41,
         query_blocks=1,
-        capture_window_min_rgb_frames=257,
-        capture_window_curriculum_start_max_rgb_frames=321,
-        capture_window_max_rgb_frames=321,
-        capture_window_curriculum_epochs=0,
-        capture_frame_stride_min=2,
-        capture_frame_stride_max=3,
+        local_window_rgb_frames=81,
+        memory_views_min=2,
+        memory_views_max=24,
     )
     sample = item.make_sample(config, random.Random(7))
     capture = sample.capture_rgb_indices
@@ -240,22 +191,35 @@ def test_sample_is_interleaved_uniform_disjoint_capture_and_query() -> None:
         index for block in sample.query_rgb_blocks for index in block
     )
     assert all(
-        right - left == sample.capture_frame_stride
-        for left, right in zip(capture, capture[1:])
-    )
-    assert all(
-        right - left == sample.capture_frame_stride
+        right - left == 1
         for left, right in zip(query, query[1:])
     )
     assert set(capture).isdisjoint(query)
-    assert sample.capture_window_start <= query[0]
-    assert query[-1] <= sample.capture_window_end
-    assert (
-        query[0] - sample.capture_window_start
-    ) % sample.capture_frame_stride == sample.query_phase_offset
+    assert sample.local_window_start <= query[0]
+    assert query[-1] <= sample.local_window_end
+    assert query[0] - sample.local_window_start == 20
+    assert sample.local_window_end - query[-1] == 20
     assert len(sample.query_rgb_blocks) == 1
-    assert len(sample.query_rgb_blocks[0]) == 49
-    assert (len(capture) - 1) % config.vae_temporal_stride == 0
+    assert len(sample.query_rgb_blocks[0]) == 41
+    assert 2 <= len(capture) <= 24
+    assert config.target_latent_frames == 41
+    assert 0.0 < sample.retrieval_coverage_score <= 1.0
+
+
+def test_pose_facility_retrieval_is_deterministic_for_seed() -> None:
+    item = VipeRoomTourItem.__new__(VipeRoomTourItem)
+    item.root = Path("/fake/scene.mp4")
+    item.indices = list(range(200))
+    item.pose_by_index = {}
+    for index in item.indices:
+        pose = np.eye(4, dtype=np.float32)
+        pose[0, 3] = index / 100.0
+        item.pose_by_index[index] = pose
+    config = GeometryMemorySampleConfig()
+    first = item.make_sample(config, random.Random(11))
+    second = item.make_sample(config, random.Random(11))
+    assert first.capture_rgb_indices == second.capture_rgb_indices
+    assert first.query_rgb_blocks == second.query_rgb_blocks
 
 
 def test_ray_at_principal_point_is_camera_forward() -> None:
