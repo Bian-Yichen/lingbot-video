@@ -164,6 +164,7 @@ def parse_args() -> argparse.Namespace:
         default=True,
     )
     parser.add_argument("--dataloader_workers", type=int, default=0)
+    parser.add_argument("--dataloader_prefetch_factor", type=int, default=1)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--log_every", type=int, default=10)
     parser.add_argument(
@@ -201,6 +202,8 @@ def parse_args() -> argparse.Namespace:
         )
     if args.dataloader_workers < 0:
         parser.error("--dataloader_workers cannot be negative")
+    if args.dataloader_prefetch_factor < 1:
+        parser.error("--dataloader_prefetch_factor must be positive")
     if args.pruning_budget < 1:
         parser.error("--pruning_budget must be positive")
     if args.vae_encode_chunk_rgb_frames < 1:
@@ -617,6 +620,7 @@ def main() -> None:
         sample_config,
         item_list=_read_item_list(args.item_list),
         seed=args.seed,
+        preload_training_inputs=True,
     )
     logger.info(
         "dataset eligibility epoch=1 total=%d eligible=%d skipped=%d%s",
@@ -631,6 +635,14 @@ def main() -> None:
         ),
     )
     loader_generator = torch.Generator().manual_seed(args.seed)
+    dataloader_kwargs: dict[str, Any] = {}
+    if args.dataloader_workers > 0:
+        # One uint8 sample is roughly 75-100 MB at 480x832. Keep only one
+        # pending sample per worker to bound /dev/shm while still overlapping
+        # mounted-storage I/O with the current GPU forward/backward.
+        dataloader_kwargs["prefetch_factor"] = (
+            args.dataloader_prefetch_factor
+        )
     dataloader = DataLoader(
         dataset,
         batch_size=1,
@@ -641,6 +653,7 @@ def main() -> None:
         generator=loader_generator,
         # Workers are recreated each epoch so they see dataset.set_epoch().
         persistent_workers=False,
+        **dataloader_kwargs,
     )
 
     backbone, vae, prompt_embeds, prompt_mask = _load_base(
@@ -723,6 +736,11 @@ def main() -> None:
     run_summary = {
         "dataset_root": args.dataset_root,
         "data_access": "direct_local_filesystem",
+        "data_pipeline": (
+            "worker_preloads_uint8_rgb_and_camera_metadata_no_main_reindex"
+        ),
+        "dataloader_workers": args.dataloader_workers,
+        "dataloader_prefetch_factor": args.dataloader_prefetch_factor,
         "dataset_items": len(dataset),
         "dataset_items_total": dataset.total_item_count,
         "dataset_items_skipped_epoch_1": dataset.skipped_item_count,
