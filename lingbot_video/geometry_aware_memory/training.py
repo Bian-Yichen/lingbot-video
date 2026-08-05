@@ -39,7 +39,7 @@ class PreparedQueryBlock:
 
 @dataclass
 class PreparedTrajectoryBatch:
-    item: VipeRoomTourItem
+    item: VipeRoomTourItem | None
     sample: RoomTourSample
     capture_latents: torch.Tensor
     capture_c2w: torch.Tensor
@@ -85,7 +85,7 @@ def _require_independent_wan_vae(vae: torch.nn.Module) -> None:
 @torch.no_grad()
 def encode_wan_frames_independently(
     vae: torch.nn.Module,
-    item: VipeRoomTourItem,
+    item: VipeRoomTourItem | None,
     indices: list[int] | tuple[int, ...],
     target_hw: tuple[int, int],
     *,
@@ -94,6 +94,7 @@ def encode_wan_frames_independently(
     dtype: torch.dtype,
     profile_timings: ProfileTimings | None = None,
     profile_prefix: str = "vae",
+    preloaded_video: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Encode every RGB frame as an independent one-frame Wan sample.
 
@@ -108,6 +109,25 @@ def encode_wan_frames_independently(
         raise ValueError("cannot encode an empty frame set")
     if read_chunk_rgb_frames < 1:
         raise ValueError("read_chunk_rgb_frames must be positive")
+    if preloaded_video is None and item is None:
+        raise ValueError("item is required when preloaded_video is absent")
+    if preloaded_video is not None:
+        expected_shape = (3, len(indices), target_hw[0], target_hw[1])
+        if tuple(preloaded_video.shape) != expected_shape:
+            raise ValueError(
+                "preloaded video must be [3,T,H,W] aligned with indices; "
+                f"expected {expected_shape}, got {tuple(preloaded_video.shape)}"
+            )
+        if preloaded_video.dtype not in {
+            torch.uint8,
+            torch.float16,
+            torch.bfloat16,
+            torch.float32,
+        }:
+            raise TypeError(
+                "preloaded video must be uint8 or floating point, got "
+                f"{preloaded_video.dtype}"
+            )
     autocast = (
         torch.autocast("cuda", dtype=dtype)
         if device.type == "cuda" and dtype in {torch.float16, torch.bfloat16}
@@ -121,19 +141,26 @@ def encode_wan_frames_independently(
             f"{profile_prefix}_rgb_read",
             device,
         ):
-            video = item.read_video(read_indices, target_hw)
+            if preloaded_video is None:
+                assert item is not None
+                video_chunk = item.read_video(read_indices, target_hw)
+            else:
+                video_chunk = preloaded_video[
+                    :, position : position + len(read_indices)
+                ]
         with synchronized_stage(
             profile_timings,
             f"{profile_prefix}_h2d_preprocess",
             device,
         ):
             images = (
-                video.permute(1, 0, 2, 3)
+                video_chunk.permute(1, 0, 2, 3)
                 .unsqueeze(2)
                 .to(device=device, dtype=torch.float32)
-                .mul(2.0)
-                .sub(1.0)
             )
+            if video_chunk.dtype == torch.uint8:
+                images.div_(255.0)
+            images.mul_(2.0).sub_(1.0)
         with synchronized_stage(
             profile_timings,
             f"{profile_prefix}_vae_forward",
@@ -166,7 +193,7 @@ def encode_wan_frames_independently(
             latent_chunks.append(
                 dit_latents.squeeze(2).permute(1, 0, 2, 3).unsqueeze(0).cpu()
             )
-        del video, images, encoded, latents, dit_latents
+        del video_chunk, images, encoded, latents, dit_latents
     output = torch.cat(latent_chunks, dim=2)
     if output.shape[2] != len(indices):
         raise RuntimeError(
@@ -187,12 +214,17 @@ def prepare_gim_trajectory_online(
 ) -> PreparedTrajectoryBatch:
     """Read RGB and run every VAE encoding online for one scene iteration."""
 
+    preloaded = sample.preloaded_inputs
     with synchronized_stage(
         profile_timings,
         "scene_index_init",
         device,
     ):
-        item = VipeRoomTourItem(Path(sample.local_root))
+        item = (
+            None
+            if preloaded is not None
+            else VipeRoomTourItem(Path(sample.local_root))
+        )
     origin_index = sample.capture_start
     capture_latents = encode_wan_frames_independently(
         vae,
@@ -204,6 +236,11 @@ def prepare_gim_trajectory_online(
         dtype=compute_dtype,
         profile_timings=profile_timings,
         profile_prefix="memory",
+        preloaded_video=(
+            preloaded.capture_rgb_uint8
+            if preloaded is not None
+            else None
+        ),
     )
     capture_latent_indices = sample.capture_rgb_indices
     with synchronized_stage(
@@ -211,11 +248,16 @@ def prepare_gim_trajectory_online(
         "memory_camera_metadata",
         device,
     ):
-        capture_c2w, capture_k = item.cameras(
-            capture_latent_indices,
-            sample.image_hw,
-            origin_index=origin_index,
-        )
+        if preloaded is None:
+            assert item is not None
+            capture_c2w, capture_k = item.cameras(
+                capture_latent_indices,
+                sample.image_hw,
+                origin_index=origin_index,
+            )
+        else:
+            capture_c2w = preloaded.capture_c2w
+            capture_k = preloaded.capture_intrinsics
         capture_times = torch.tensor(
             [
                 int(index) - origin_index
@@ -225,11 +267,18 @@ def prepare_gim_trajectory_online(
         )
 
     query_blocks: list[PreparedQueryBlock] = []
-    for rgb_indices, geometry_query_index in zip(
-        sample.query_rgb_blocks,
-        sample.geometry_query_indices,
-        strict=True,
+    for block_index, (rgb_indices, geometry_query_index) in enumerate(
+        zip(
+            sample.query_rgb_blocks,
+            sample.geometry_query_indices,
+            strict=True,
+        )
     ):
+        query_rgb_uint8 = (
+            preloaded.query_rgb_uint8_blocks[block_index]
+            if preloaded is not None
+            else None
+        )
         latents = encode_wan_frames_independently(
             vae,
             item,
@@ -240,6 +289,7 @@ def prepare_gim_trajectory_online(
             dtype=compute_dtype,
             profile_timings=profile_timings,
             profile_prefix="target",
+            preloaded_video=query_rgb_uint8,
         )
         latent_rgb_indices = rgb_indices
         with synchronized_stage(
@@ -247,25 +297,40 @@ def prepare_gim_trajectory_online(
             "target_camera_metadata",
             device,
         ):
-            c2w, intrinsics = item.cameras(
-                latent_rgb_indices,
-                sample.image_hw,
-                origin_index=origin_index,
-            )
-            query_c2w, query_intrinsics = item.cameras(
-                [geometry_query_index],
-                sample.image_hw,
-                origin_index=origin_index,
-            )
+            if preloaded is None:
+                assert item is not None
+                c2w, intrinsics = item.cameras(
+                    latent_rgb_indices,
+                    sample.image_hw,
+                    origin_index=origin_index,
+                )
+            else:
+                c2w = preloaded.query_c2w_blocks[block_index]
+                intrinsics = preloaded.query_intrinsics_blocks[block_index]
+            geometry_position = rgb_indices.index(geometry_query_index)
+            query_c2w = c2w[geometry_position : geometry_position + 1]
+            query_intrinsics = intrinsics[
+                geometry_position : geometry_position + 1
+            ]
         with synchronized_stage(
             profile_timings,
             "geometry_rgb_read",
             device,
         ):
-            geometry_query_rgb = item.read_rgb(
-                geometry_query_index,
-                sample.image_hw,
-            ).unsqueeze(0)
+            if preloaded is None:
+                assert item is not None
+                geometry_query_rgb = item.read_rgb(
+                    geometry_query_index,
+                    sample.image_hw,
+                ).unsqueeze(0)
+            else:
+                assert query_rgb_uint8 is not None
+                geometry_query_rgb = (
+                    query_rgb_uint8[:, geometry_position]
+                    .float()
+                    .div_(255.0)
+                    .unsqueeze(0)
+                )
         query_blocks.append(
             PreparedQueryBlock(
                 rgb_indices=rgb_indices,
