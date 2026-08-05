@@ -74,8 +74,8 @@ def _config_defaults() -> dict[str, Any]:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Train GIM-World with interleaved sparse capture/query "
-            "room-tour trajectories."
+            "Train GIM-World from local target trajectories and a small set "
+            "of pose-retrieved memory views."
         )
     )
     parser.add_argument("--config", required=True)
@@ -91,31 +91,19 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--height", type=int, default=480)
     parser.add_argument("--width", type=int, default=832)
-    parser.add_argument("--target_rgb_frames", type=int, default=49)
+    parser.add_argument("--target_rgb_frames", type=int, default=41)
     parser.add_argument("--query_blocks", type=int, default=1)
-    parser.add_argument("--vae_temporal_stride", type=int, default=4)
-    parser.add_argument("--vae_encode_chunk_rgb_frames", type=int, default=81)
-    parser.add_argument("--capture_window_min_rgb_frames", type=int, default=257)
-    parser.add_argument("--capture_window_max_rgb_frames", type=int, default=1000)
+    parser.add_argument("--local_window_rgb_frames", type=int, default=81)
+    parser.add_argument("--memory_views_min", type=int, default=2)
+    parser.add_argument("--memory_views_max", type=int, default=24)
+    parser.add_argument("--retrieval_rotation_weight", type=float, default=0.25)
+    parser.add_argument("--retrieval_temperature", type=float, default=0.25)
     parser.add_argument(
-        "--capture_window_curriculum_start_max_rgb_frames",
-        type=int,
-        default=321,
+        "--vae_frame_mode",
+        choices=["independent"],
+        default="independent",
     )
-    parser.add_argument(
-        "--capture_window_curriculum_epochs",
-        type=int,
-        default=5,
-    )
-    parser.add_argument(
-        "--capture_window_min_fraction_of_current_max",
-        type=float,
-        default=0.75,
-    )
-    parser.add_argument("--capture_frame_stride_min", type=int, default=2)
-    parser.add_argument("--capture_frame_stride_max", type=int, default=3)
-    parser.add_argument("--trajectory_pose_stride", type=int, default=4)
-    parser.add_argument("--trajectory_rotation_weight", type=float, default=0.25)
+    parser.add_argument("--vae_encode_chunk_rgb_frames", type=int, default=4)
 
     parser.add_argument("--pruning_budget", type=int, default=200)
     parser.add_argument("--memory_latent_frames", type=int, default=20)
@@ -204,13 +192,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("--dataloader_workers cannot be negative")
     if args.pruning_budget < 1:
         parser.error("--pruning_budget must be positive")
-    if args.vae_encode_chunk_rgb_frames < 5:
-        parser.error("--vae_encode_chunk_rgb_frames must be at least 5")
-    if (args.vae_encode_chunk_rgb_frames - 1) % args.vae_temporal_stride:
-        parser.error(
-            "--vae_encode_chunk_rgb_frames must equal "
-            "1 + k * vae_temporal_stride"
-        )
+    if args.vae_encode_chunk_rgb_frames < 1:
+        parser.error("--vae_encode_chunk_rgb_frames must be positive")
     for name in (
         "predicted_update_probability_start",
         "predicted_update_probability_end",
@@ -357,12 +340,8 @@ def _distributed_mean_metrics(
             len(sample.capture_rgb_indices),
             dtype=torch.float32,
         ),
-        "train/capture_window_rgb_frames": output["loss"].new_tensor(
-            sample.capture_window_end - sample.capture_window_start + 1,
-            dtype=torch.float32,
-        ),
-        "train/capture_frame_stride": output["loss"].new_tensor(
-            sample.capture_frame_stride,
+        "train/local_window_rgb_frames": output["loss"].new_tensor(
+            sample.local_window_end - sample.local_window_start + 1,
             dtype=torch.float32,
         ),
     }
@@ -430,12 +409,12 @@ def _scene_record(
         "memory_norm": float(
             output["memory_norm"].detach().float().item()
         ),
-        "capture_window_start": sample.capture_window_start,
-        "capture_window_end": sample.capture_window_end,
-        "capture_frame_stride": sample.capture_frame_stride,
+        "local_window_start": sample.local_window_start,
+        "local_window_end": sample.local_window_end,
         "capture_rgb_frames": len(sample.capture_rgb_indices),
         "query_start": sample.query_start,
         "query_end": sample.query_rgb_blocks[-1][-1],
+        "retrieval_coverage_score": sample.retrieval_coverage_score,
         "overlap_score": sample.trajectory_overlap_score,
         "elapsed_seconds": elapsed_seconds,
     }
@@ -446,8 +425,9 @@ def _log_scene_record(record: dict[str, Any]) -> None:
         "scene epoch=%d/%d iter=%d/%d rank=%d item=%s "
         "global_step=%d optimizer_step=%s accumulation=%d/%d "
         "loss=%.6g flow_loss=%.6g geometry_loss=%.6g sigma=%.4f "
-        "window=%d:%d stride=%d capture_rgb=%d capture_latents=%.0f "
-        "query=%d:%d overlap=%.4f history=%.0f/%.0f "
+        "window=%d:%d memory_views=%d memory_latents=%.0f "
+        "target=%d:%d retrieval_coverage=%.4f overlap=%.4f "
+        "history=%.0f/%.0f "
         "memory_norm=%.6g elapsed=%.1fs",
         record["epoch"],
         record["num_epochs"],
@@ -463,13 +443,13 @@ def _log_scene_record(record: dict[str, Any]) -> None:
         record["flow_loss"],
         record["geometry_loss"],
         record["sigma"],
-        record["capture_window_start"],
-        record["capture_window_end"],
-        record["capture_frame_stride"],
+        record["local_window_start"],
+        record["local_window_end"],
         record["capture_rgb_frames"],
         record["capture_latent_frames"],
         record["query_start"],
         record["query_end"],
+        record["retrieval_coverage_score"],
         record["overlap_score"],
         record["history_retained"],
         record["history_candidates"],
@@ -564,22 +544,11 @@ def main() -> None:
         width=args.width,
         target_rgb_frames=args.target_rgb_frames,
         query_blocks=args.query_blocks,
-        vae_temporal_stride=args.vae_temporal_stride,
-        capture_window_min_rgb_frames=args.capture_window_min_rgb_frames,
-        capture_window_max_rgb_frames=args.capture_window_max_rgb_frames,
-        capture_window_curriculum_start_max_rgb_frames=(
-            args.capture_window_curriculum_start_max_rgb_frames
-        ),
-        capture_window_curriculum_epochs=(
-            args.capture_window_curriculum_epochs
-        ),
-        capture_window_min_fraction_of_current_max=(
-            args.capture_window_min_fraction_of_current_max
-        ),
-        capture_frame_stride_min=args.capture_frame_stride_min,
-        capture_frame_stride_max=args.capture_frame_stride_max,
-        trajectory_pose_stride=args.trajectory_pose_stride,
-        trajectory_rotation_weight=args.trajectory_rotation_weight,
+        local_window_rgb_frames=args.local_window_rgb_frames,
+        memory_views_min=args.memory_views_min,
+        memory_views_max=args.memory_views_max,
+        retrieval_rotation_weight=args.retrieval_rotation_weight,
+        retrieval_temperature=args.retrieval_temperature,
     )
     sample_config.validate()
     dataset = LocalVipeRoomTourDataset(
@@ -680,7 +649,6 @@ def main() -> None:
     base_training_config = GIMTrainingConfig(
         pruning_budget=args.pruning_budget,
         geometry_loss_weight=args.geometry_loss_weight,
-        vae_temporal_stride=args.vae_temporal_stride,
         vae_encode_chunk_rgb_frames=args.vae_encode_chunk_rgb_frames,
         timestep_shift=args.timestep_shift,
     )
@@ -699,34 +667,26 @@ def main() -> None:
         "dataset_items_skipped_epoch_1": dataset.skipped_item_count,
         "scene_iterations_per_epoch": len(dataset),
         "scene_sampling": (
-            "one_random_interleaved_capture_query_window_per_scene_per_epoch"
+            "one_random_local_window_per_scene_per_epoch"
         ),
         "resolution": [args.height, args.width],
-        "capture_window_rgb_frames": [
-            args.capture_window_min_rgb_frames,
-            args.capture_window_max_rgb_frames,
-        ],
-        "capture_window_curriculum_start_max": (
-            args.capture_window_curriculum_start_max_rgb_frames
+        "local_window_rgb_frames": args.local_window_rgb_frames,
+        "memory_views": [args.memory_views_min, args.memory_views_max],
+        "memory_retrieval": (
+            "pose-aware greedy facility location over non-target local views"
         ),
-        "capture_window_curriculum_epochs": (
-            args.capture_window_curriculum_epochs
-        ),
-        "capture_window_min_fraction_of_current_max": (
-            args.capture_window_min_fraction_of_current_max
-        ),
-        "capture_frame_stride": [
-            args.capture_frame_stride_min,
-            args.capture_frame_stride_max,
-        ],
+        "retrieval_rotation_weight": args.retrieval_rotation_weight,
+        "retrieval_temperature": args.retrieval_temperature,
         "query_blocks": args.query_blocks,
         "query_rgb_frames_per_block": args.target_rgb_frames,
         "query_rgb_frames_total": sample_config.query_rgb_frames,
         "query_latent_frames_per_block": sample_config.target_latent_frames,
         "capture_query_relation": (
-            "different regular-sampling phases inside one shared window"
+            "continuous centered target withheld from a shared local window"
         ),
-        "vae_execution": "online_from_rgb_every_scene_iteration",
+        "vae_execution": "online_independent_single_frame_encode",
+        "vae_frame_mode": "independent",
+        "rgb_frames_per_latent": 1,
         "vggt_execution": "online_from_rgb_every_query_block",
         "persistent_feature_cache": False,
         "vae_read_chunk_rgb_frames": args.vae_encode_chunk_rgb_frames,
@@ -877,14 +837,17 @@ def main() -> None:
         if accelerator.is_main_process:
             logger.info(
                 "epoch=%d/%d scenes=%d/%d skipped=%d "
-                "capture_window_bounds=%s "
+                "local_window=%d memory_views=%d..%d target=%d "
                 "predicted_update_probability=%.3f",
                 epoch + 1,
                 args.num_train_epochs,
                 len(dataset),
                 dataset.total_item_count,
                 dataset.skipped_item_count,
-                sample_config.capture_window_bounds_for_epoch(epoch),
+                sample_config.local_window_rgb_frames,
+                sample_config.memory_views_min,
+                sample_config.memory_views_max,
+                sample_config.query_rgb_frames,
                 update_probability,
             )
 
@@ -895,7 +858,6 @@ def main() -> None:
             prepared = prepare_gim_trajectory_online(
                 sample,
                 vae=vae,
-                vae_temporal_stride=args.vae_temporal_stride,
                 vae_encode_chunk_rgb_frames=(
                     args.vae_encode_chunk_rgb_frames
                 ),
