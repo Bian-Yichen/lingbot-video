@@ -13,6 +13,14 @@ install_torch26_custom_op_compat()
 
 
 _EXPORTS = {
+    "ActiveWorldMemoryConfig": (
+        "lingbot_video.active_world_memory.model",
+        "ActiveWorldMemoryConfig",
+    ),
+    "ActiveWorldMemoryModel": (
+        "lingbot_video.active_world_memory.model",
+        "ActiveWorldMemoryModel",
+    ),
     "FlowUniPCMultistepScheduler": (
         "lingbot_video.scheduling_flow_unipc",
         "FlowUniPCMultistepScheduler",
