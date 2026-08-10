@@ -216,8 +216,12 @@ def _pool_episodes(
     counts = view_tokens.new_zeros(batch, max_episodes, 1)
     for batch_index in range(batch):
         valid_ids = episode_ids[batch_index].masked_fill(~view_mask[batch_index], 0)
+        # scatter_add_ requires its source to have exactly the destination
+        # dtype.  Confidence may arrive as fp32 while view tokens are produced
+        # under mixed precision, so normalize it explicitly here.
         weights = (
-            view_mask[batch_index].float() * view_confidence[batch_index].float()
+            view_mask[batch_index].to(view_tokens.dtype)
+            * view_confidence[batch_index].to(view_tokens.dtype)
         )
         weighted = view_tokens[batch_index] * weights.unsqueeze(-1)
         output[batch_index].scatter_add_(
