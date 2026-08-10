@@ -120,10 +120,18 @@ def _retrieval_teacher_losses(
         target_distribution * teacher_view_logits.log_softmax(dim=-1)
     ).sum(dim=-1).mean()
 
-    episode_target = torch.zeros_like(logits.episode_logits)
+    # Camera geometry is intentionally evaluated in fp32, while the policy
+    # logits can be bf16/fp16 under Accelerator autocast.  scatter_add_ does
+    # not perform implicit dtype conversion, so keep the teacher aggregation
+    # in the relevance dtype instead of inheriting the logits dtype.
+    episode_target = torch.zeros_like(
+        logits.episode_logits, dtype=relevance.dtype
+    )
     episode_target.scatter_add_(1, memory.view_episode_ids, relevance)
     episode_target = episode_target / episode_target.sum(dim=-1, keepdim=True).clamp_min(1e-8)
-    capture_episode_count = torch.zeros_like(logits.episode_logits)
+    capture_episode_count = torch.zeros_like(
+        logits.episode_logits, dtype=torch.float32
+    )
     capture_episode_count.scatter_add_(
         1, memory.view_episode_ids, capture_mask.float()
     )
