@@ -85,7 +85,15 @@ class GIMWorldLingBotModel(nn.Module):
         history_intrinsics: torch.Tensor,
     ) -> torch.Tensor:
         del history_c2w, history_intrinsics
-        return self.patchify_history(history_latents)
+        tokens = self.patchify_history(history_latents)
+        if tokens.ndim != 4:
+            raise RuntimeError(
+                "patchified history must be [B,T,P,D], got "
+                f"{tuple(tokens.shape)}"
+            )
+        # The backbone consumes one joint sequence per sample. Preserve every
+        # history patch, but merge the temporal and spatial-token axes.
+        return tokens.flatten(1, 2)
 
     def target_action_embeddings(
         self,
