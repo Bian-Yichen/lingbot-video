@@ -19,7 +19,7 @@
   "pruning_budget": 24,
   "memory_latent_frames": 4,
   "compact_stride": 2,
-  "geometry_loss_weight": 0.05,
+  "geometry_loss_weight": 0.0,
   "sigma_position": -1,
   "sigma_rotation": 0.5235987755982988,
   "sigma_time": 50,
