@@ -222,8 +222,9 @@ class GIMWorldLingBotModel(nn.Module):
         query_c2w: torch.Tensor,
         query_intrinsics: torch.Tensor,
         teacher_image_hw: tuple[int, int],
+        compute_geometry: bool = True,
         encoder_attention_mask: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor]:
         """Joint paper training path, kept in one forward for DDP/FSDP."""
 
         memory = self.build_memory(
@@ -243,10 +244,12 @@ class GIMWorldLingBotModel(nn.Module):
             target_action_embeddings=actions,
             encoder_attention_mask=encoder_attention_mask,
         )
-        geometry = self.geometry_prediction(
-            memory,
-            query_c2w,
-            query_intrinsics,
-            teacher_image_hw=teacher_image_hw,
-        )
+        geometry = None
+        if compute_geometry:
+            geometry = self.geometry_prediction(
+                memory,
+                query_c2w,
+                query_intrinsics,
+                teacher_image_hw=teacher_image_hw,
+            )
         return prediction, geometry, memory
