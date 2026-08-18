@@ -750,11 +750,7 @@ def main() -> None:
         "vae_execution": "online_independent_single_frame_encode",
         "vae_frame_mode": "independent",
         "rgb_frames_per_latent": 1,
-        "vggt_execution": (
-            "online_from_rgb_every_query_block"
-            if teacher is not None
-            else "disabled_flow_matching_only"
-        ),
+        "vggt_execution": "disabled_flow_matching_only",
         "persistent_feature_cache": False,
         "vae_read_chunk_rgb_frames": args.vae_encode_chunk_rgb_frames,
         "dynamic_memory_update": (
