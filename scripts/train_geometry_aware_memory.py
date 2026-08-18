@@ -770,7 +770,7 @@ def main() -> None:
         "rgb_frames_per_latent": 1,
         "vggt_execution": (
             "online_from_rgb_every_query_block"
-            if teacher is not None
+            if args.geometry_loss_weight > 0.0
             else "disabled_flow_matching_only"
         ),
         "persistent_feature_cache": False,
