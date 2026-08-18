@@ -11,7 +11,6 @@ import torch.nn.functional as F
 from .data import RoomTourSample, VipeRoomTourItem
 from .model import GIMWorldLingBotModel
 from .pruning import MIGreedyPruner
-from .teacher import VGGTGeometryTeacher
 
 
 @dataclass(frozen=True)
@@ -338,7 +337,6 @@ def gim_trajectory_training_step(
     model: GIMWorldLingBotModel,
     batch: PreparedTrajectoryBatch,
     *,
-    teacher: VGGTGeometryTeacher | None,
     pruner: MIGreedyPruner,
     prompt_embeds: torch.Tensor,
     prompt_mask: torch.Tensor,
@@ -390,25 +388,7 @@ def gim_trajectory_training_step(
         noisy = (1.0 - sigma_broadcast) * target + sigma_broadcast * noise
         velocity_target = noise - target
 
-        use_geometry = config.geometry_loss_weight > 0.0
-        if use_geometry:
-            if teacher is None:
-                raise ValueError(
-                    "teacher is required when geometry_loss_weight is positive"
-                )
-            teacher_features, teacher_grid = teacher.encode(
-                block.geometry_query_rgb,
-                item_name=batch.sample.item_name,
-                frame_index=block.geometry_query_index,
-            )
-            teacher_image_hw = (
-                teacher_grid[0] * teacher.config.patch_size,
-                teacher_grid[1] * teacher.config.patch_size,
-            )
-        else:
-            teacher_features = None
-            teacher_image_hw = batch.sample.image_hw
-        predicted, geometry_prediction, memory = model(
+        predicted, memory = model(
             noisy,
             sigma * 1000.0,
             prompt_embeds,
@@ -417,40 +397,14 @@ def gim_trajectory_training_step(
             history_intrinsics=selected_k,
             target_c2w=target_c2w,
             target_intrinsics=target_k,
-            query_c2w=block.geometry_query_c2w.to(device),
-            query_intrinsics=block.geometry_query_intrinsics.to(device),
-            teacher_image_hw=teacher_image_hw,
-            compute_geometry=use_geometry,
             encoder_attention_mask=prompt_mask,
         )
         flow_loss = F.mse_loss(
             predicted.float(),
             velocity_target.float(),
         )
-        if not use_geometry:
-            geometry_loss = flow_loss.new_zeros(())
-        elif geometry_prediction is None or teacher_features is None:
-            raise RuntimeError("geometry outputs are missing while geometry loss is enabled")
-        elif geometry_prediction.shape[1] != teacher_features.shape[1]:
-            raise RuntimeError(
-                "VGGT patch count does not match the geometry head: "
-                f"{teacher_features.shape[1]} vs "
-                f"{geometry_prediction.shape[1]}"
-            )
-        else:
-            geometry_loss = (
-                1.0
-                - F.cosine_similarity(
-                    geometry_prediction.float(),
-                    teacher_features.to(
-                        device=geometry_prediction.device,
-                        dtype=torch.float32,
-                    ),
-                    dim=-1,
-                    eps=1e-8,
-                ).mean()
-            )
-        loss = flow_loss + config.geometry_loss_weight * geometry_loss
+        geometry_loss = flow_loss.new_zeros(())
+        loss = flow_loss
 
         # A write is useful only when another target block follows and can
         # train against the updated memory.  The default one-block schedule
