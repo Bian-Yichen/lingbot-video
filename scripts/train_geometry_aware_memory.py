@@ -682,6 +682,11 @@ def main() -> None:
             teacher_grid_width=teacher_hw[1] // 14,
         ),
     )
+    if args.geometry_loss_weight == 0.0:
+        # The geometry decoder is intentionally absent from the flow-only
+        # graph. Freeze it before optimizer/DDP construction so DDP does not
+        # wait for gradients from parameters that cannot contribute to loss.
+        model.geometry_head.requires_grad_(False)
     if args.gradient_checkpointing:
         model.backbone.enable_gradient_checkpointing()
         model.memory_encoder.gradient_checkpointing = True
@@ -827,6 +832,11 @@ def main() -> None:
         ),
         "geometry_head_parameters": sum(
             p.numel() for p in unwrapped.geometry_head.parameters()
+        ),
+        "geometry_head_trainable_parameters": sum(
+            p.numel()
+            for p in unwrapped.geometry_head.parameters()
+            if p.requires_grad
         ),
         "action_encoder_parameters": sum(
             p.numel() for p in unwrapped.action_encoder.parameters()
