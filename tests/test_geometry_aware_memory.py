@@ -464,7 +464,7 @@ def test_direct_memory_preserves_every_history_patch_token() -> None:
     cameras = torch.eye(4).reshape(1, 1, 4, 4).repeat(1, 5, 1, 1)
     intrinsics = torch.eye(3).reshape(1, 1, 3, 3).repeat(1, 5, 1, 1)
     memory = model.build_memory(history, cameras, intrinsics)
-    expected = model.patchify_history(history)
+    expected = model.patchify_history(history).flatten(1, 2)
     assert memory.shape == (1, 5 * 4 * 6, 32)
     torch.testing.assert_close(memory, expected)
 
