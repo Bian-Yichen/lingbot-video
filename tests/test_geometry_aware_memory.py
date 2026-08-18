@@ -29,6 +29,10 @@ from lingbot_video.geometry_aware_memory.lora import (
     inject_backbone_lora,
 )
 from lingbot_video.geometry_aware_memory.inference import DynamicGIMHistory
+from lingbot_video.geometry_aware_memory.model import (
+    GIMWorldLingBotModel,
+    GIMWorldModelConfig,
+)
 from lingbot_video.geometry_aware_memory.geometry import (
     make_origin_direction_rays,
 )
@@ -436,6 +440,33 @@ def test_lingbot_memory_is_temporal_prefix_but_output_is_target_only() -> None:
         return_dict=False,
     )[0]
     assert output.shape == target.shape
+
+
+def test_direct_memory_preserves_every_history_patch_token() -> None:
+    backbone = LingBotVideoTransformer3DModel(
+        patch_size=(1, 2, 2),
+        in_channels=4,
+        out_channels=4,
+        hidden_size=32,
+        num_attention_heads=4,
+        depth=1,
+        intermediate_size=64,
+        text_dim=16,
+        freq_dim=16,
+        axes_dims=(2, 2, 4),
+        axes_lens=(128, 32, 32),
+    )
+    model = GIMWorldLingBotModel(
+        backbone,
+        GIMWorldModelConfig(image_height=64, image_width=96),
+    )
+    history = torch.randn(1, 4, 5, 8, 12)
+    cameras = torch.eye(4).reshape(1, 1, 4, 4).repeat(1, 5, 1, 1)
+    intrinsics = torch.eye(3).reshape(1, 1, 3, 3).repeat(1, 5, 1, 1)
+    memory = model.build_memory(history, cameras, intrinsics)
+    expected = model.patchify_history(history)
+    assert memory.shape == (1, 5 * 4 * 6, 32)
+    torch.testing.assert_close(memory, expected)
 
 
 def test_backbone_lora_freezes_base_and_updates_only_adapters() -> None:
