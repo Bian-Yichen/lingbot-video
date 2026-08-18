@@ -345,8 +345,6 @@ def main() -> None:
             lora_summary.parameter_count,
             int(training_config.get("lora_rank", 32)),
         )
-    # VGGT and the geometry decoder are training-only in GIM-World.
-    del model.geometry_head
     model.eval().to(device)
 
     item_path = LocalRoomTourIndex(args.dataset_root).item_path(args.item_name)
