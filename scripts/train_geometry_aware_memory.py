@@ -39,11 +39,6 @@ from lingbot_video.geometry_aware_memory.pruning import (  # noqa: E402
     MIGreedyPruner,
     PoseTimeKernelConfig,
 )
-from lingbot_video.geometry_aware_memory.teacher import (  # noqa: E402
-    VGGTGeometryTeacher,
-    VGGTTeacherConfig,
-    vggt_target_hw,
-)
 from lingbot_video.geometry_aware_memory.training import (  # noqa: E402
     GIMTrainingConfig,
     gim_trajectory_training_step,
@@ -588,6 +583,10 @@ def _scheduled_probability(args: argparse.Namespace, epoch: int) -> float:
 
 def main() -> None:
     args = parse_args()
+    if args.geometry_loss_weight != 0.0:
+        raise ValueError(
+            "the direct-memory ablation requires geometry_loss_weight=0"
+        )
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
@@ -670,21 +669,15 @@ def main() -> None:
             backbone,
             lora_config_from_mapping(vars(args)),
         )
-    teacher_hw = vggt_target_hw((args.height, args.width))
     model = GIMWorldLingBotModel(
         backbone,
         GIMWorldModelConfig(
             image_height=args.height,
             image_width=args.width,
-            memory_latent_frames=args.memory_latent_frames,
-            compact_stride=args.compact_stride,
-            teacher_grid_height=teacher_hw[0] // 14,
-            teacher_grid_width=teacher_hw[1] // 14,
         ),
     )
     if args.gradient_checkpointing:
         model.backbone.enable_gradient_checkpointing()
-        model.memory_encoder.gradient_checkpointing = True
     optimizer = torch.optim.AdamW(
         [
             parameter
@@ -703,17 +696,6 @@ def main() -> None:
     prompt_embeds = prompt_embeds.to(accelerator.device)
     prompt_mask = prompt_mask.to(accelerator.device)
 
-    # A zero geometry weight is a true flow-matching-only ablation: VGGT is
-    # neither loaded nor executed and the geometry decoder is bypassed.
-    teacher = None
-    if args.geometry_loss_weight > 0.0:
-        teacher = VGGTGeometryTeacher(
-            VGGTTeacherConfig(
-                model_id=args.vggt_model_id,
-            ),
-            device=accelerator.device,
-            dtype=_dtype(args.mixed_precision),
-        )
     pruner = MIGreedyPruner(
         PoseTimeKernelConfig(
             sigma_position=args.sigma_position,
@@ -785,17 +767,15 @@ def main() -> None:
             args.predicted_update_probability_end,
         ],
         "pruning_budget": args.pruning_budget,
-        "memory_latent_frames": args.memory_latent_frames,
+        "memory_latent_frames": "all_retained_history_frames",
         "memory_patch_grid": [patch_height, patch_width],
         "memory_token_count": (
-            args.memory_latent_frames * patch_height * patch_width
+            args.pruning_budget * patch_height * patch_width
         ),
         "memory_attention_tokens_at_full_budget": (
-            (args.memory_latent_frames + args.pruning_budget)
-            * compact_height
-            * compact_width
+            (args.pruning_budget * 2) * patch_height * patch_width
         ),
-        "compact_stride": args.compact_stride,
+        "compact_stride": "disabled",
         "geometry_loss_weight": args.geometry_loss_weight,
         "backbone_train_mode": args.backbone_train_mode,
         "lora_rank": (
@@ -822,12 +802,8 @@ def main() -> None:
         "checkpoint_every_iterations": args.checkpoint_every_iterations,
         "total_parameters": total_parameters,
         "trainable_parameters": trainable_parameters,
-        "memory_encoder_parameters": sum(
-            p.numel() for p in unwrapped.memory_encoder.parameters()
-        ),
-        "geometry_head_parameters": sum(
-            p.numel() for p in unwrapped.geometry_head.parameters()
-        ),
+        "memory_encoder_parameters": 0,
+        "geometry_head_parameters": 0,
         "action_encoder_parameters": sum(
             p.numel() for p in unwrapped.action_encoder.parameters()
         ),
@@ -1021,7 +997,6 @@ def main() -> None:
                 output = gim_trajectory_training_step(
                     model,
                     prepared,
-                    teacher=teacher,
                     pruner=pruner,
                     prompt_embeds=prompt_embeds,
                     prompt_mask=prompt_mask,
