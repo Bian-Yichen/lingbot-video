@@ -703,15 +703,17 @@ def main() -> None:
     prompt_embeds = prompt_embeds.to(accelerator.device)
     prompt_mask = prompt_mask.to(accelerator.device)
 
-    # No cache object exists in this loop. VGGT is frozen but executes from
-    # the sampled target RGB on every query block of every scene iteration.
-    teacher = VGGTGeometryTeacher(
-        VGGTTeacherConfig(
-            model_id=args.vggt_model_id,
-        ),
-        device=accelerator.device,
-        dtype=_dtype(args.mixed_precision),
-    )
+    # A zero geometry weight is a true flow-matching-only ablation: VGGT is
+    # neither loaded nor executed and the geometry decoder is bypassed.
+    teacher = None
+    if args.geometry_loss_weight > 0.0:
+        teacher = VGGTGeometryTeacher(
+            VGGTTeacherConfig(
+                model_id=args.vggt_model_id,
+            ),
+            device=accelerator.device,
+            dtype=_dtype(args.mixed_precision),
+        )
     pruner = MIGreedyPruner(
         PoseTimeKernelConfig(
             sigma_position=args.sigma_position,
@@ -766,7 +768,11 @@ def main() -> None:
         "vae_execution": "online_independent_single_frame_encode",
         "vae_frame_mode": "independent",
         "rgb_frames_per_latent": 1,
-        "vggt_execution": "online_from_rgb_every_query_block",
+        "vggt_execution": (
+            "online_from_rgb_every_query_block"
+            if teacher is not None
+            else "disabled_flow_matching_only"
+        ),
         "persistent_feature_cache": False,
         "vae_read_chunk_rgb_frames": args.vae_encode_chunk_rgb_frames,
         "dynamic_memory_update": (
