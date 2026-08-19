@@ -96,6 +96,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--local_window_rgb_frames", type=int, default=81)
     parser.add_argument("--memory_views_min", type=int, default=2)
     parser.add_argument("--memory_views_max", type=int, default=24)
+    parser.add_argument(
+        "--identity_memory_target",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Use one RGB/latent as both the sole memory view and sole target "
+            "to isolate memory-encoder trainability."
+        ),
+    )
     parser.add_argument("--retrieval_rotation_weight", type=float, default=0.25)
     parser.add_argument("--retrieval_temperature", type=float, default=0.25)
     parser.add_argument(
@@ -222,6 +231,31 @@ def parse_args() -> argparse.Namespace:
             lora_config_from_mapping(vars(args))
         except (TypeError, ValueError) as error:
             parser.error(str(error))
+    if args.identity_memory_target:
+        expected = {
+            "target_rgb_frames": 1,
+            "query_blocks": 1,
+            "local_window_rgb_frames": 1,
+            "memory_views_min": 1,
+            "memory_views_max": 1,
+            "pruning_budget": 1,
+            "memory_latent_frames": 1,
+            "geometry_loss_weight": 0.0,
+            "backbone_train_mode": "frozen",
+        }
+        mismatched = {
+            name: (getattr(args, name), value)
+            for name, value in expected.items()
+            if getattr(args, name) != value
+        }
+        if mismatched:
+            parser.error(
+                "identity_memory_target has incompatible settings: "
+                + ", ".join(
+                    f"{name}={actual!r} (expected {required!r})"
+                    for name, (actual, required) in mismatched.items()
+                )
+            )
     return args
 
 
@@ -425,6 +459,9 @@ def _scene_record(
         "memory_norm": float(
             output["memory_norm"].detach().float().item()
         ),
+        "memory_encoder_grad_norm": float(
+            output["memory_encoder_grad_norm"].detach().float().item()
+        ),
         "local_window_start": sample.local_window_start,
         "local_window_end": sample.local_window_end,
         "capture_rgb_frames": len(sample.capture_rgb_indices),
@@ -444,7 +481,7 @@ def _log_scene_record(record: dict[str, Any]) -> None:
         "window=%d:%d memory_views=%d memory_latents=%.0f "
         "target=%d:%d retrieval_coverage=%.4f overlap=%.4f "
         "history=%.0f/%.0f "
-        "memory_norm=%.6g elapsed=%.1fs",
+        "memory_norm=%.6g memory_grad_norm=%.6g elapsed=%.1fs",
         record["epoch"],
         record["num_epochs"],
         record["iteration"],
@@ -471,6 +508,7 @@ def _log_scene_record(record: dict[str, Any]) -> None:
         record["history_retained"],
         record["history_candidates"],
         record["memory_norm"],
+        record["memory_encoder_grad_norm"],
         record["elapsed_seconds"],
     )
 
@@ -613,6 +651,7 @@ def main() -> None:
         memory_views_max=args.memory_views_max,
         retrieval_rotation_weight=args.retrieval_rotation_weight,
         retrieval_temperature=args.retrieval_temperature,
+        identity_memory_target=args.identity_memory_target,
     )
     sample_config.validate()
     dataset = LocalVipeRoomTourDataset(
@@ -680,6 +719,7 @@ def main() -> None:
             compact_stride=args.compact_stride,
             teacher_grid_height=teacher_hw[0] // 14,
             teacher_grid_width=teacher_hw[1] // 14,
+            use_target_camera_actions=not args.identity_memory_target,
         ),
     )
     if args.geometry_loss_weight == 0.0:
@@ -690,6 +730,20 @@ def main() -> None:
     if args.gradient_checkpointing:
         model.backbone.enable_gradient_checkpointing()
         model.memory_encoder.gradient_checkpointing = True
+    if args.identity_memory_target:
+        trainable_names = [
+            name
+            for name, parameter in model.named_parameters()
+            if parameter.requires_grad
+        ]
+        if not trainable_names or any(
+            not name.startswith("memory_encoder.")
+            for name in trainable_names
+        ):
+            raise RuntimeError(
+                "identity experiment must train only memory_encoder, got "
+                f"{trainable_names[:16]}"
+            )
     optimizer = torch.optim.AdamW(
         [
             parameter
@@ -759,7 +813,9 @@ def main() -> None:
         "local_window_rgb_frames": args.local_window_rgb_frames,
         "memory_views": [args.memory_views_min, args.memory_views_max],
         "memory_retrieval": (
-            "pose-aware greedy facility location over non-target local views"
+            "disabled_identity_single_view"
+            if args.identity_memory_target
+            else "pose-aware greedy facility location over non-target local views"
         ),
         "retrieval_rotation_weight": args.retrieval_rotation_weight,
         "retrieval_temperature": args.retrieval_temperature,
@@ -768,8 +824,11 @@ def main() -> None:
         "query_rgb_frames_total": sample_config.query_rgb_frames,
         "query_latent_frames_per_block": sample_config.target_latent_frames,
         "capture_query_relation": (
-            "continuous centered target withheld from a shared local window"
+            "same_single_rgb_is_memory_and_target"
+            if args.identity_memory_target
+            else "continuous centered target withheld from a shared local window"
         ),
+        "identity_memory_target": args.identity_memory_target,
         "vae_execution": "online_independent_single_frame_encode",
         "vae_frame_mode": "independent",
         "rgb_frames_per_latent": 1,
@@ -840,6 +899,11 @@ def main() -> None:
         ),
         "action_encoder_parameters": sum(
             p.numel() for p in unwrapped.action_encoder.parameters()
+        ),
+        "action_encoder_trainable_parameters": sum(
+            p.numel()
+            for p in unwrapped.action_encoder.parameters()
+            if p.requires_grad
         ),
         "backbone_parameters": backbone_total,
         "backbone_trainable_parameters": backbone_trainable,
@@ -1039,6 +1103,18 @@ def main() -> None:
                     device=accelerator.device,
                     compute_dtype=_dtype(args.mixed_precision),
                     backward=backward_scene,
+                )
+                memory_grad_squares = [
+                    parameter.grad.detach().float().square().sum()
+                    for parameter in accelerator.unwrap_model(
+                        model
+                    ).memory_encoder.parameters()
+                    if parameter.grad is not None
+                ]
+                output["memory_encoder_grad_norm"] = (
+                    torch.stack(memory_grad_squares).sum().sqrt()
+                    if memory_grad_squares
+                    else output["loss"].new_zeros(())
                 )
                 if accelerator.sync_gradients:
                     accelerator.clip_grad_norm_(
