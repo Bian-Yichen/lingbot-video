@@ -1,7 +1,7 @@
 {
   "model_dir": "/mnt/shared-storage-user/bianyichen/lingbot-video-dense-1.3b",
   "dataset_root": "/data/bianyichen/H-hdd/AnyReconProDataset_labeled_2",
-  "output_dir": "/mnt/shared-storage-user/bianyichen/lingbot-video-output-single-image-memory",
+  "output_dir": "/mnt/shared-storage-user/bianyichen/lingbot-video-output/gim-single-image-memory",
   "resume_from_checkpoint": null,
   "item_list": "/mnt/shared-storage-user/bianyichen/gim_world_train_items.txt",
   "prompt": "An indoor room tour.",
