@@ -382,6 +382,9 @@ def main() -> None:
         retrieval_temperature=float(
             training_config.get("retrieval_temperature", 0.25)
         ),
+        identity_memory_target=bool(
+            training_config.get("identity_memory_target", False)
+        ),
     )
     sample_config.validate()
     sample_epoch = _sample_epoch_from_checkpoint(
@@ -702,8 +705,11 @@ def main() -> None:
         "vae_frame_mode": "independent one-frame encode/decode",
         "cache_mode": "disabled; memory-view VAE runs online from RGB",
         "query_input_note": (
-            "Only query camera poses/intrinsics enter generation. Query RGB is "
-            "read after generation for ground-truth evaluation only."
+            "The sole query RGB is intentionally also encoded as the sole "
+            "memory input for the identity reconstruction experiment."
+            if training_config.get("identity_memory_target", False)
+            else "Only query camera poses/intrinsics enter generation. Query "
+            "RGB is read after generation for ground-truth evaluation only."
         ),
         "dynamic_update_note": (
             "Each generated latent block is appended and memory is rebuilt "
