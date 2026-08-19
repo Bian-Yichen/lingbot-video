@@ -26,6 +26,10 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+memory-reconstruction = [
+  "lpips>=0.1.4",
+  "torchvision>=0.20.0",
+]
 sglang = [
   "sglang>=0.4.9",
   "triton>=3.0.0",
