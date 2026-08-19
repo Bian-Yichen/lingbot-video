@@ -294,6 +294,7 @@ class PluckerRGBDecoder(nn.Module):
         c2w: torch.Tensor,
         intrinsics: torch.Tensor,
     ) -> torch.Tensor:
+        import pdb; pdb.set_trace()
         memory_tokens = self.memory_projection(memory)
         queries = self._ray_queries(c2w, intrinsics)
         memory_length = memory_tokens.shape[1]
@@ -317,6 +318,7 @@ class PluckerRGBDecoder(nn.Module):
         target_c2w: torch.Tensor,
         target_intrinsics: torch.Tensor,
     ) -> torch.Tensor:
+        import pdb; pdb.set_trace()
         if target_c2w.ndim != 4 or target_c2w.shape[-2:] != (4, 4):
             raise ValueError("target_c2w must be [B,T,4,4]")
         if target_intrinsics.shape[:2] != target_c2w.shape[:2]:
@@ -430,6 +432,7 @@ class GIMMemoryReconstructionModel(nn.Module):
         history_intrinsics: torch.Tensor,
     ) -> torch.Tensor:
         tokens = self.patchify_history(history_latents)
+        import pdb; pdb.set_trace()
         cameras = camera_vector(
             history_c2w,
             history_intrinsics,
@@ -448,6 +451,7 @@ class GIMMemoryReconstructionModel(nn.Module):
         target_c2w: torch.Tensor,
         target_intrinsics: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        import pdb; pdb.set_trace()
         memory = self.build_memory(
             history_latents,
             history_c2w,

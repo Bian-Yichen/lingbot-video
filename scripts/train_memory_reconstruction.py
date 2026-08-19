@@ -538,6 +538,7 @@ def main() -> None:
                 compute_dtype=_dtype(args.mixed_precision),
             )
             with accelerator.accumulate(model):
+                import pdb; pdb.set_trace()
                 output = reconstruction_training_step(
                     model,
                     prepared,
