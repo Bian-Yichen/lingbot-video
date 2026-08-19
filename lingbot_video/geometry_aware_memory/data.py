@@ -116,14 +116,32 @@ class GeometryMemorySampleConfig:
     memory_views_max: int = 24
     retrieval_rotation_weight: float = 0.25
     retrieval_temperature: float = 0.25
+    identity_memory_target: bool = False
 
     def validate(self) -> None:
         if self.height % 16 or self.width % 16:
             raise ValueError("height and width must be multiples of 16")
-        if self.target_rgb_frames < 2:
-            raise ValueError("target_rgb_frames must be at least 2")
+        if self.target_rgb_frames < 1:
+            raise ValueError("target_rgb_frames must be positive")
         if self.query_blocks < 1:
             raise ValueError("query_blocks must be positive")
+        if self.identity_memory_target:
+            if (
+                self.target_rgb_frames != 1
+                or self.query_blocks != 1
+                or self.local_window_rgb_frames != 1
+                or self.memory_views_min != 1
+                or self.memory_views_max != 1
+            ):
+                raise ValueError(
+                    "identity_memory_target requires exactly one target frame, "
+                    "one query block, one-frame local window, and one memory view"
+                )
+            return
+        if self.target_rgb_frames < 2:
+            raise ValueError(
+                "non-identity sampling requires at least two target frames"
+            )
         if self.local_window_rgb_frames < self.query_rgb_frames + 2:
             raise ValueError(
                 "local_window_rgb_frames must leave at least two non-target "
@@ -384,13 +402,21 @@ class VipeRoomTourItem:
             sample.image_hw,
             origin_index=origin_index,
         )
-        query_cameras = tuple(
-            self.cameras(
-                block,
-                sample.image_hw,
-                origin_index=origin_index,
+        identity_sample = (
+            len(sample.query_rgb_blocks) == 1
+            and sample.capture_rgb_indices == sample.query_rgb_blocks[0]
+        )
+        query_cameras = (
+            ((capture_c2w, capture_k),)
+            if identity_sample
+            else tuple(
+                self.cameras(
+                    block,
+                    sample.image_hw,
+                    origin_index=origin_index,
+                )
+                for block in sample.query_rgb_blocks
             )
-            for block in sample.query_rgb_blocks
         )
         camera_seconds = time.perf_counter() - camera_started_at
 
@@ -399,9 +425,13 @@ class VipeRoomTourItem:
             sample.capture_rgb_indices,
             sample.image_hw,
         )
-        query_rgb_blocks = tuple(
-            self.read_video_uint8(block, sample.image_hw)
-            for block in sample.query_rgb_blocks
+        query_rgb_blocks = (
+            (capture_rgb,)
+            if identity_sample
+            else tuple(
+                self.read_video_uint8(block, sample.image_hw)
+                for block in sample.query_rgb_blocks
+            )
         )
         rgb_read_seconds = time.perf_counter() - rgb_started_at
         return replace(
@@ -619,6 +649,21 @@ class VipeRoomTourItem:
                 "target trajectory must lie inside the local window"
             )
         query_set = set(query)
+        if config.identity_memory_target:
+            frame = query[0]
+            return RoomTourSample(
+                item_name=self.root.name,
+                local_root=str(self.root),
+                epoch=int(epoch),
+                local_window_start=frame,
+                local_window_end=frame,
+                capture_rgb_indices=(frame,),
+                query_rgb_blocks=((frame,),),
+                geometry_query_indices=(frame,),
+                retrieval_coverage_score=1.0,
+                trajectory_overlap_score=0.0,
+                image_hw=(config.height, config.width),
+            )
         candidates = tuple(
             index
             for index in range(window_start, window_end + 1)
