@@ -30,6 +30,7 @@ class GIMWorldModelConfig:
     teacher_grid_width: int = 37
     teacher_feature_dim: int = 2048
     geometry_num_heads: int = 16
+    use_target_camera_actions: bool = True
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -81,6 +82,8 @@ class GIMWorldLingBotModel(nn.Module):
             norm_eps=float(backbone.config.norm_eps),
         )
         self.action_encoder = TargetCameraActionEncoder(16, hidden_size)
+        if not config.use_target_camera_actions:
+            self.action_encoder.requires_grad_(False)
 
     @property
     def patch_grid(self) -> tuple[int, int]:
@@ -138,6 +141,13 @@ class GIMWorldLingBotModel(nn.Module):
         target_c2w: torch.Tensor,
         target_intrinsics: torch.Tensor,
     ) -> torch.Tensor:
+        if not self.gim_config.use_target_camera_actions:
+            return torch.zeros(
+                *target_c2w.shape[:2],
+                int(self.backbone.config.hidden_size),
+                device=target_c2w.device,
+                dtype=self.backbone.patch_embedder.weight.dtype,
+            )
         cameras = camera_vector(
             target_c2w,
             target_intrinsics,
