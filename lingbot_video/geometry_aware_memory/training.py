@@ -231,6 +231,10 @@ def prepare_gim_trajectory_online(
     )
 
     query_blocks: list[PreparedQueryBlock] = []
+    identity_sample = (
+        len(sample.query_rgb_blocks) == 1
+        and sample.capture_rgb_indices == sample.query_rgb_blocks[0]
+    )
     for block_index, (rgb_indices, geometry_query_index) in enumerate(
         zip(
             sample.query_rgb_blocks,
@@ -243,15 +247,19 @@ def prepare_gim_trajectory_online(
             if preloaded is not None
             else None
         )
-        latents = encode_wan_frames_independently(
-            vae,
-            item,
-            rgb_indices,
-            sample.image_hw,
-            read_chunk_rgb_frames=vae_encode_chunk_rgb_frames,
-            device=device,
-            dtype=compute_dtype,
-            preloaded_video=query_rgb_uint8,
+        latents = (
+            capture_latents
+            if identity_sample
+            else encode_wan_frames_independently(
+                vae,
+                item,
+                rgb_indices,
+                sample.image_hw,
+                read_chunk_rgb_frames=vae_encode_chunk_rgb_frames,
+                device=device,
+                dtype=compute_dtype,
+                preloaded_video=query_rgb_uint8,
+            )
         )
         latent_rgb_indices = rgb_indices
         if preloaded is None:
