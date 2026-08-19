@@ -305,6 +305,27 @@ def test_sample_has_continuous_target_and_pose_retrieved_small_memory() -> None:
     assert 0.0 < sample.retrieval_coverage_score <= 1.0
 
 
+def test_identity_sample_uses_exact_same_single_frame_for_memory_and_target() -> None:
+    item = VipeRoomTourItem.__new__(VipeRoomTourItem)
+    item.root = Path("/fake/scene.mp4")
+    item.indices = list(range(1000))
+    config = GeometryMemorySampleConfig(
+        target_rgb_frames=1,
+        query_blocks=1,
+        local_window_rgb_frames=1,
+        memory_views_min=1,
+        memory_views_max=1,
+        identity_memory_target=True,
+    )
+    sample = item.make_sample(config, random.Random(7))
+    assert len(sample.capture_rgb_indices) == 1
+    assert sample.capture_rgb_indices == sample.query_rgb_blocks[0]
+    assert sample.geometry_query_indices == sample.capture_rgb_indices
+    assert sample.local_window_start == sample.local_window_end
+    assert sample.retrieval_coverage_score == 1.0
+    assert sample.trajectory_overlap_score == 0.0
+
+
 def test_pose_facility_retrieval_is_deterministic_for_seed() -> None:
     item = VipeRoomTourItem.__new__(VipeRoomTourItem)
     item.root = Path("/fake/scene.mp4")
