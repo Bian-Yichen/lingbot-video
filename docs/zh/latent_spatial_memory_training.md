@@ -1,8 +1,8 @@
 # LingBot-Video Latent Spatial Memory
 
 本分支从 `compat/glibc217-torch26` 独立开发，将论文 *Latent Spatial Memory
-for Video World Models*（Mirage）适配到 LingBot-Video，并直接读取
-`h:bianyichen/AnyReconProDataset_labeled/` 中的 VIPE 标注。
+for Video World Models*（Mirage）适配到 LingBot-Video，并从本地挂载目录
+`/data/bianyichen/H-hdd/AnyReconProDataset_labeled_2` 直接读取 VIPE 标注。
 
 ## 1. 方法与论文的对应关系
 
@@ -78,9 +78,10 @@ LingBot 原始发布模型没有 camera-control branch，因此将目标相机�
 1. VIPE 每 5 个原始视频帧估计一次 depth/pose/intrinsics；RGB 文件名、depth
    EXR 文件名以及 pose/intrinsics NPZ 的 `inds` 都使用稀疏原始索引
    `0,5,10,...`。加载器只保留 5 的倍数，并统一映射成连续训练索引
-   `internal=source/5`，所以后续采样逻辑仍处理 `0,1,2,...`。rclone 也只下载
-   对应的稀疏 RGB。
-2. 在节点本地 cache 中保留该 item，默认连续产生 32 个 iteration。
+   `internal=source/5`，所以后续采样逻辑仍处理 `0,1,2,...`。
+2. `DataLoader` worker 直接打开本地 scene，并让同一个 item 默认连续产生 32 个
+   iteration。RGB 在 worker 中完成 resize/crop 后以 `uint8` 穿过多进程队列，
+   移到 GPU 后才转换为 `[0,1]` float，depth/pose/intrinsics 同样在 worker 预取。
 3. 每次从目标帧之前最长 4096 帧的历史中分层抽取 16/20 个连续 capture clip；
    每个 clip 为 9 RGB，经过 causal VAE 后得到 3 个 temporal latent anchor，
    分别绑定到该 clip 的第 `0/4/8` 帧 depth 和 pose。Memory 因而覆盖整条长历史，
@@ -159,10 +160,11 @@ c_y'=s_y(c_y+0.5)-0.5-t,
 pip install -r requirements-training.txt
 ```
 
-确保 `rclone config file` 能找到 `h:`，然后：
+确认数据目录已挂载，然后先检查一个 scene：
 
 ```bash
 python scripts/inspect_latent_spatial_memory_dataset.py \
+  --dataset_root /data/bianyichen/H-hdd/AnyReconProDataset_labeled_2 \
   --item_name _750e401Wkl_004000_009000.mp4
 
 MODEL_DIR=/path/to/LingBot-Video-Dense \
@@ -178,7 +180,7 @@ MODEL_DIR=/path/to/LingBot-Video-Dense \
 CONFIG=configs/latent_spatial_memory_stage2.json \
 NUM_PROCESSES=8 \
 EXTRA_ARGS="--init_component_checkpoint \
-outputs/latent_spatial_memory_stage1/final/trainable_components.pt" \
+/mnt/shared-storage-user/bianyichen/lingbot-video-output-mirage/stage1/final/trainable_components.pt" \
 bash scripts/train_latent_spatial_memory.sh
 ```
 
@@ -189,22 +191,21 @@ bash scripts/train_latent_spatial_memory.sh
 
 ## 7. 验证推理
 
-下面从同一 VIPE item 的长 capture history 出发，沿标注轨迹生成 257 帧；推理只
-读取 camera pose/intrinsics，不读取目标 RGB/depth：
+下面从同一 VIPE item 的长 capture history 出发，执行一个与训练相同形状的
+9-latent chunk 推理：
 
 ```bash
 python scripts/inference_latent_spatial_memory.py \
   --model_dir /path/to/LingBot-Video-Dense \
-  --checkpoint outputs/latent_spatial_memory_stage2/final/trainable_components.pt \
-  --dataset_root h:bianyichen/AnyReconProDataset_labeled/ \
+  --checkpoint /mnt/shared-storage-user/bianyichen/lingbot-video-output-mirage/stage2/final/trainable_components.pt \
+  --dataset_root /data/bianyichen/H-hdd/AnyReconProDataset_labeled_2 \
   --item_name _750e401Wkl_004000_009000.mp4 \
   --target_start 4096 \
-  --num_frames 257 \
-  --output outputs/mirage_validation.mp4
+  --output_dir outputs/mirage_validation
 ```
 
-同时输出 `mirage_validation.depth.npz`，包含生成更新使用的预测 depth、归一化
-camera poses 与 intrinsics。
+输出目录包含生成/GT/VAE 对比视频、预测 depth、归一化 camera poses、intrinsics
+与指标 JSON。
 
 ## 8. 关键配置建议
 
@@ -212,6 +213,7 @@ camera poses 与 intrinsics。
 - Stage 2 再将 `capture_clips` 增至 20；不建议一开始将 5000 帧全部编码。
 - `memory_voxel_size=0` 最忠实于论文；长推理可设置约 `0.02 m`，每个 voxel
   保留最新且最高置信 observation，不平均 latent feature。
-- 如果单个 item 很大，继续提高 `samples_per_item`，以摊薄下载成本。
+- 如果单个 item 很大，继续提高 `samples_per_item`，以摊薄 scene 索引和 depth
+  archive 打开的成本。
 - item 中完整 depth 不足以覆盖 `history_min_frames` 时会跳过，不会误用
   `.partial` 文件。

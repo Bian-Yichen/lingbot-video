@@ -12,23 +12,21 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
 
 from lingbot_video.latent_spatial_memory.data import (  # noqa: E402
+    LocalRoomTourIndex,
     SOURCE_FRAME_STRIDE,
     LongTrajectorySampleConfig,
-    RcloneConfig,
-    RoomTourItemCache,
     VipeRoomTourItem,
 )
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Materialize one remote VIPE item and validate a training sample."
+        description="Open one local VIPE item and validate a training sample."
     )
     parser.add_argument(
         "--dataset_root",
-        default="h:bianyichen/AnyReconProDataset_labeled/",
+        default="/data/bianyichen/H-hdd/AnyReconProDataset_labeled_2",
     )
-    parser.add_argument("--cache_root", default="/tmp/lingbot_latent_memory_cache")
     parser.add_argument("--item_name", default=None)
     parser.add_argument("--height", type=int, default=480)
     parser.add_argument("--width", type=int, default=832)
@@ -40,27 +38,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--history_max_frames", type=int, default=4096)
     parser.add_argument("--latent_frames_per_chunk", type=int, default=9)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--rclone_config", default=None)
-    parser.add_argument(
-        "--rclone_clear_proxy",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-    )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    cache = RoomTourItemCache(
-        args.dataset_root,
-        args.cache_root,
-        rclone=RcloneConfig(
-            config_path=args.rclone_config,
-            clear_proxy=args.rclone_clear_proxy,
-        ),
-    )
-    item_name = args.item_name or cache.list_items()[0]
-    item = VipeRoomTourItem(cache.materialize(item_name))
+    item_index = LocalRoomTourIndex(args.dataset_root)
+    item_name = args.item_name or item_index.list_items()[0]
+    item = VipeRoomTourItem(item_index.item_path(item_name))
     print(
         "Sparse RGB/depth/pose/intrinsics source index s -> internal index "
         f"s / {SOURCE_FRAME_STRIDE}"

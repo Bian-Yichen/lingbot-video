@@ -1,8 +1,8 @@
 {
   "stage": "side_branch",
-  "dataset_root": "h:bianyichen/AnyReconProDataset_labeled_2/",
-  "cache_root": "/tmp/lingbot_latent_memory_cache_2",
-  "output_dir": "/mnt/petrelfs/bianyichen/3DVision/lingbot-video-output/train",
+  "model_dir": "/mnt/shared-storage-user/bianyichen/lingbot-video-dense-1.3b",
+  "dataset_root": "/data/bianyichen/H-hdd/AnyReconProDataset_labeled_2",
+  "output_dir": "/mnt/shared-storage-user/bianyichen/lingbot-video-output-mirage/stage1",
   "height": 480,
   "width": 832,
   "capture_clips": 16,
@@ -37,8 +37,5 @@
   "mixed_precision": "bf16",
   "gradient_checkpointing": true,
   "checkpoint_every": 1000,
-  "save_accelerator_state": false,
-  "rclone_clear_proxy": true,
-  "rclone_transfers": 32,
-  "rclone_checkers": 32
+  "save_accelerator_state": false
 }

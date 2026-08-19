@@ -54,9 +54,10 @@ Appendix C 的 48-channel 描述不同，本分支以论文为准。
   的多视角深度一致性门控。若后续加入 dynamic mask，可直接并入 `valid_mask`。
 - Camera pose 除了用于 3D memory readout，还以 zero-init Plücker adapter 提供未观察
   区域的相机控制。这是 LingBot 没有原生 camera-control branch 时的必要补充。
-- 原始远程数据没有预计算 LMDB latent，因此训练时由冻结 VAE 编码。一个 item
-  下载一次并复用多个 iteration；后续可把 clip latent 做成本地持久 cache，而不改变
-  模型输入或监督。
+- 本地挂载数据没有预计算 LMDB latent，因此训练时由冻结 VAE 编码。每个 worker
+  直接读取 scene，并让一个 item 连续复用多个 iteration；RGB 以 uint8 预加载后
+  再在 GPU 上归一化。后续可把 clip latent 做成本地持久 cache，而不改变模型输入
+  或监督。
 
 这些改动均独立于 VACE 注入拓扑和论文 flow objective，checkpoint 中也分别以
 `controlnet`、`depth_head` 和 LoRA 参数保存。

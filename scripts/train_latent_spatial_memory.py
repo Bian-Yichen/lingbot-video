@@ -20,9 +20,9 @@ from lingbot_video.latent_spatial_memory.controlnet import (  # noqa: E402
     LingBotLatentMemoryControlNet,
 )
 from lingbot_video.latent_spatial_memory.data import (  # noqa: E402
+    LocalVipeRoomTourDataset,
     LongTrajectorySampleConfig,
-    RcloneConfig,
-    RemoteVipeRoomTourDataset,
+    normalize_preloaded_rgb,
 )
 from lingbot_video.latent_spatial_memory.model import (  # noqa: E402
     LatentMetricDepthHead,
@@ -61,9 +61,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model_dir", required=False)
     parser.add_argument(
         "--dataset_root",
-        default="h:bianyichen/AnyReconProDataset_labeled_2/",
+        default="/data/bianyichen/H-hdd/AnyReconProDataset_labeled_2",
     )
-    parser.add_argument("--cache_root", default="/tmp/lingbot_latent_memory_cache")
     parser.add_argument("--output_dir", default="outputs/latent_spatial_memory")
     parser.add_argument("--stage", choices=["side_branch", "lora"], default="side_branch")
     parser.add_argument("--init_component_checkpoint", default=None)
@@ -120,11 +119,6 @@ def parse_args() -> argparse.Namespace:
         help="Also save the full Accelerator/FSDP state; large but supports exact optimizer resume.",
     )
     parser.add_argument("--item_list", default=None)
-    parser.add_argument("--rclone_binary", default="rclone")
-    parser.add_argument("--rclone_config", default=None)
-    parser.add_argument("--rclone_clear_proxy", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--rclone_transfers", type=int, default=32)
-    parser.add_argument("--rclone_checkers", type=int, default=32)
     parser.set_defaults(**_config_defaults())
     args = parser.parse_args()
     if not args.model_dir:
@@ -389,18 +383,9 @@ def main() -> None:
         min_depth=args.min_depth,
         max_depth=args.max_depth,
     )
-    rclone = RcloneConfig(
-        binary=args.rclone_binary,
-        config_path=args.rclone_config,
-        clear_proxy=args.rclone_clear_proxy,
-        transfers=args.rclone_transfers,
-        checkers=args.rclone_checkers,
-    )
-    dataset = RemoteVipeRoomTourDataset(
+    dataset = LocalVipeRoomTourDataset(
         args.dataset_root,
-        args.cache_root,
         sample_config,
-        rclone=rclone,
         item_list=_read_item_list(args.item_list),
         seed=args.seed,
         rank=accelerator.process_index,
@@ -417,9 +402,9 @@ def main() -> None:
         # frames; avoid the DataLoader default of two prefetched batches/worker.
         dataloader_options["prefetch_factor"] = 1
     dataloader = DataLoader(dataset, **dataloader_options)
-    # The iterable dataset already shards items by rank and worker so that
-    # processes download different large room-tour items.  Preparing the
-    # DataLoader as well would apply a second Accelerate shard and waste data.
+    # The iterable dataset already shards local scenes by rank and worker.
+    # Preparing the DataLoader as well would apply a second Accelerate shard
+    # and waste data.
     model, optimizer, scheduler = accelerator.prepare(
         model,
         optimizer,
@@ -462,6 +447,7 @@ def main() -> None:
             else value
             for key, value in batch.items()
         }
+        normalize_preloaded_rgb(batch)
         with accelerator.accumulate(model):
             with accelerator.autocast():
                 output = latent_memory_training_step(

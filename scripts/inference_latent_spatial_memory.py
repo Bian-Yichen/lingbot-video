@@ -23,11 +23,11 @@ from lingbot_video.latent_spatial_memory.controlnet import (  # noqa: E402
     LingBotLatentMemoryControlNet,
 )
 from lingbot_video.latent_spatial_memory.data import (  # noqa: E402
+    LocalRoomTourIndex,
     LongTrajectorySampleConfig,
-    RcloneConfig,
-    RoomTourItemCache,
     SOURCE_FRAME_STRIDE,
     VipeRoomTourItem,
+    normalize_preloaded_rgb,
 )
 from lingbot_video.latent_spatial_memory.geometry import (  # noqa: E402
     make_plucker_rays,
@@ -62,7 +62,6 @@ logger = logging.getLogger("lingbot_video.inference_latent_spatial_memory")
 INHERITED_ARGUMENTS = {
     "model_dir",
     "dataset_root",
-    "cache_root",
     "prompt",
     "height",
     "width",
@@ -85,11 +84,6 @@ INHERITED_ARGUMENTS = {
     "mixed_precision",
     "lora_rank",
     "lora_alpha",
-    "rclone_binary",
-    "rclone_config",
-    "rclone_clear_proxy",
-    "rclone_transfers",
-    "rclone_checkers",
 }
 
 
@@ -147,10 +141,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model_dir", default=None)
     parser.add_argument(
         "--dataset_root",
-        default="h:bianyichen/AnyReconProDataset_labeled/",
+        default="/data/bianyichen/H-hdd/AnyReconProDataset_labeled_2",
     )
     parser.add_argument("--item_name", required=True)
-    parser.add_argument("--cache_root", default="/tmp/lingbot_latent_memory_cache")
     parser.add_argument("--output_dir", required=True)
     parser.add_argument("--prompt", default="An indoor room tour.")
     parser.add_argument("--height", type=int, default=480)
@@ -197,15 +190,6 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Output FPS. Defaults to source FPS / 5 when metadata provides it, else 6.",
     )
-    parser.add_argument("--rclone_binary", default="rclone")
-    parser.add_argument("--rclone_config", default=None)
-    parser.add_argument(
-        "--rclone_clear_proxy",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-    )
-    parser.add_argument("--rclone_transfers", type=int, default=32)
-    parser.add_argument("--rclone_checkers", type=int, default=32)
     parser.set_defaults(**inherited)
     args = parser.parse_args()
     args.checkpoint = checkpoint or _resolve_checkpoint(args.checkpoint)
@@ -404,12 +388,14 @@ def _batch_sample(
     sample: dict[str, torch.Tensor | str],
     device: torch.device,
 ) -> dict[str, torch.Tensor | str]:
-    return {
+    batch = {
         key: value.unsqueeze(0).to(device, non_blocking=True)
         if torch.is_tensor(value)
         else value
         for key, value in sample.items()
     }
+    normalize_preloaded_rgb(batch)
+    return batch
 
 
 def _encode_training_inputs(
@@ -607,19 +593,9 @@ def main() -> None:
     sample_config = _sample_config(args)
     memory_config = _memory_config(args)
 
-    cache = RoomTourItemCache(
-        args.dataset_root,
-        args.cache_root,
-        rclone=RcloneConfig(
-            binary=args.rclone_binary,
-            config_path=args.rclone_config,
-            clear_proxy=args.rclone_clear_proxy,
-            transfers=args.rclone_transfers,
-            checkers=args.rclone_checkers,
-        ),
-    )
-    logger.info("materializing scene %s", args.item_name)
-    item = VipeRoomTourItem(cache.materialize(args.item_name))
+    item_index = LocalRoomTourIndex(args.dataset_root)
+    logger.info("loading local scene %s", args.item_name)
+    item = VipeRoomTourItem(item_index.item_path(args.item_name))
     sample_rng = _TargetStartRandom(args.sample_seed, args.target_start)
     sample = item.sample(sample_config, sample_rng)
     target_start = int(sample["target_rgb_indices"][0].item())
@@ -732,15 +708,27 @@ def main() -> None:
     _write_video(output_dir / "ground_truth.mp4", ground_truth_rgb, fps)
     _write_video(output_dir / "vae_reconstruction.mp4", vae_target_rgb, fps)
     capture_rgb = (
-        sample["capture_rgb"]
+        batch["capture_rgb"][0]
         .permute(0, 2, 3, 4, 1)
         .reshape(-1, args.height, args.width, 3)
+        .float()
+        .cpu()
         .numpy()
     )
     preceding_rgb = (
-        sample["preceding_rgb"].permute(1, 2, 3, 0).numpy()
+        batch["preceding_rgb"][0]
+        .permute(1, 2, 3, 0)
+        .float()
+        .cpu()
+        .numpy()
     )
-    reference_rgb = sample["reference_rgb"].permute(0, 2, 3, 1).numpy()
+    reference_rgb = (
+        batch["reference_rgb"][0]
+        .permute(0, 2, 3, 1)
+        .float()
+        .cpu()
+        .numpy()
+    )
     _write_video(output_dir / "conditioning_capture_clips.mp4", capture_rgb, fps)
     _write_video(output_dir / "conditioning_preceding.mp4", preceding_rgb, fps)
     if reference_rgb.shape[0]:

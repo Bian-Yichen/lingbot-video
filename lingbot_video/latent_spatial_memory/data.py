@@ -1,19 +1,13 @@
 from __future__ import annotations
 
-import contextlib
-import fcntl
 import json
 import logging
-import os
 import random
-import shutil
-import subprocess
 import tempfile
-import uuid
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterator, Optional
+from typing import Iterator, MutableMapping, Optional
 
 import numpy as np
 import torch
@@ -35,173 +29,77 @@ logger = logging.getLogger(__name__)
 # contiguous internal training timeline 0,1,2,... so the rest of the sampler
 # does not need sparse-index special cases.
 SOURCE_FRAME_STRIDE = 5
+RGB_SAMPLE_KEYS = (
+    "capture_rgb",
+    "preceding_rgb",
+    "reference_rgb",
+    "target_rgb",
+)
 
 
-def _is_rclone_remote(path: str) -> bool:
-    if os.path.exists(path):
-        return False
-    head = path.split("/", 1)[0]
-    return ":" in head and not path.startswith(("s3://", "http://", "https://"))
+class LocalRoomTourIndex:
+    """Resolve mounted room-tour scenes without copying source files."""
 
+    def __init__(self, dataset_root: str | Path) -> None:
+        self.root = Path(dataset_root).expanduser().resolve()
+        if not self.root.is_dir():
+            raise FileNotFoundError(
+                f"local dataset_root is not a directory: {self.root}"
+            )
 
-def _join_remote(root: str, child: str) -> str:
-    return f"{root.rstrip('/')}/{child.strip('/')}"
-
-
-def _rclone_environment(clear_proxy: bool) -> dict[str, str]:
-    environment = dict(os.environ)
-    if clear_proxy:
-        for key in (
-            "HTTP_PROXY",
-            "HTTPS_PROXY",
-            "ALL_PROXY",
-            "http_proxy",
-            "https_proxy",
-            "all_proxy",
+    @staticmethod
+    def _validate_item_name(item_name: str) -> str:
+        item_name = item_name.strip().rstrip("/")
+        if (
+            not item_name
+            or item_name in {".", ".."}
+            or Path(item_name).name != item_name
         ):
-            environment.pop(key, None)
-    return environment
-
-
-@dataclass
-class RcloneConfig:
-    binary: str = "rclone"
-    config_path: Optional[str] = None
-    clear_proxy: bool = True
-    transfers: int = 32
-    checkers: int = 32
-
-    def base_command(self) -> list[str]:
-        command = [self.binary]
-        if self.config_path:
-            command.extend(["--config", self.config_path])
-        return command
-
-
-class RoomTourItemCache:
-    """Node-local cache that downloads one useful item subset and reuses it."""
-
-    INCLUDE_PATTERNS = (
-        "/RGB/*[05].jpg",
-        "/RGB/*[05].jpeg",
-        "/RGB/*[05].png",
-        "/RGB/*[05].webp",
-        "/RGB/*[05].JPG",
-        "/RGB/*[05].JPEG",
-        "/RGB/*[05].PNG",
-        "/RGB/*[05].WEBP",
-        "/chunk_metadata.json",
-        "/vipe/vipe_artifacts/pose/video.npz",
-        "/vipe/vipe_artifacts/intrinsics/video.npz",
-        "/vipe/vipe_artifacts/intrinsics/video_camera.txt",
-        "/vipe/vipe_artifacts/depth/video.zip",
-        "/vipe/vipe_artifacts/depth/video.zip.parts/*.zip",
-        "/vipe/vipe_artifacts/depth/video.zip.parts/manifest.json",
-    )
-
-    def __init__(
-        self,
-        dataset_root: str,
-        cache_root: str | Path,
-        *,
-        rclone: Optional[RcloneConfig] = None,
-    ) -> None:
-        self.dataset_root = dataset_root.rstrip("/")
-        self.cache_root = Path(cache_root)
-        self.cache_root.mkdir(parents=True, exist_ok=True)
-        self.rclone = rclone or RcloneConfig()
-        self.remote = _is_rclone_remote(dataset_root)
+            raise ValueError(
+                "item_name must be one direct child directory name, got "
+                f"{item_name!r}"
+            )
+        return item_name
 
     def list_items(self) -> list[str]:
-        if not self.remote:
-            root = Path(self.dataset_root)
-            items = sorted(path.name for path in root.iterdir() if path.is_dir())
-            if not items:
-                raise FileNotFoundError(f"no item directories below {root}")
-            return items
-        command = [
-            *self.rclone.base_command(),
-            "lsf",
-            self.dataset_root,
-            "--dirs-only",
-            "--max-depth",
-            "1",
-        ]
-        result = subprocess.run(
-            command,
-            check=True,
-            capture_output=True,
-            text=True,
-            env=_rclone_environment(self.rclone.clear_proxy),
-        )
-        items = sorted(line.strip().rstrip("/") for line in result.stdout.splitlines() if line.strip())
+        items = sorted(path.name for path in self.root.iterdir() if path.is_dir())
         if not items:
-            raise RuntimeError(f"rclone found no items below {self.dataset_root}")
+            raise FileNotFoundError(
+                f"no room-tour item directories below {self.root}"
+            )
         return items
 
-    @contextlib.contextmanager
-    def _item_lock(self, item_name: str) -> Iterator[None]:
-        lock_path = self.cache_root / f".{item_name}.lock"
-        with lock_path.open("a+") as handle:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-            try:
-                yield
-            finally:
-                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    def item_path(self, item_name: str) -> Path:
+        item_name = self._validate_item_name(item_name)
+        path = self.root / item_name
+        if not path.is_dir():
+            raise FileNotFoundError(
+                f"room-tour item does not exist below dataset_root: {path}"
+            )
+        return path
 
-    def materialize(self, item_name: str) -> Path:
-        if not self.remote:
-            path = Path(self.dataset_root) / item_name
-            if not path.is_dir():
-                raise FileNotFoundError(path)
-            return path
-        destination = self.cache_root / item_name
-        complete = destination / ".latent_memory_cache_complete.json"
-        if complete.is_file():
-            os.utime(complete, None)
-            return destination
-        with self._item_lock(item_name):
-            if complete.is_file():
-                os.utime(complete, None)
-                return destination
-            temporary = self.cache_root / f".partial-{item_name}-{uuid.uuid4().hex}"
-            temporary.mkdir(parents=True)
-            command = [
-                *self.rclone.base_command(),
-                "copy",
-                _join_remote(self.dataset_root, item_name),
-                str(temporary),
-                "--transfers",
-                str(self.rclone.transfers),
-                "--checkers",
-                str(self.rclone.checkers),
-                "--create-empty-src-dirs",
-            ]
-            for pattern in self.INCLUDE_PATTERNS:
-                command.extend(["--include", pattern])
-            command.extend(["--exclude", "*"])
-            try:
-                subprocess.run(
-                    command,
-                    check=True,
-                    env=_rclone_environment(self.rclone.clear_proxy),
-                )
-                marker = {
-                    "source": _join_remote(self.dataset_root, item_name),
-                    "item": item_name,
-                    "include_patterns": list(self.INCLUDE_PATTERNS),
-                }
-                (temporary / ".latent_memory_cache_complete.json").write_text(
-                    json.dumps(marker, indent=2) + "\n",
-                    encoding="utf-8",
-                )
-                if destination.exists():
-                    shutil.rmtree(destination)
-                os.replace(temporary, destination)
-            except BaseException:
-                shutil.rmtree(temporary, ignore_errors=True)
-                raise
-        return destination
+
+def normalize_preloaded_rgb(
+    batch: MutableMapping[str, torch.Tensor | str],
+) -> MutableMapping[str, torch.Tensor | str]:
+    """Convert worker-preloaded uint8 RGB to float32 [0,1] in place.
+
+    Call this after moving a batch to its compute device. Keeping RGB uint8
+    while it crosses the multiprocessing queue cuts shared-memory traffic by
+    4x without changing the values supplied to the frozen VAE.
+    """
+
+    for key in RGB_SAMPLE_KEYS:
+        value = batch.get(key)
+        if not torch.is_tensor(value):
+            raise TypeError(f"{key} must be a tensor")
+        if value.dtype == torch.uint8:
+            batch[key] = value.float().div_(255.0)
+        elif not value.is_floating_point():
+            raise TypeError(
+                f"{key} must be uint8 or floating point, got {value.dtype}"
+            )
+    return batch
 
 
 @dataclass(frozen=True)
@@ -456,7 +354,7 @@ class VipeRoomTourItem:
             image = image.crop(
                 (left, top, left + transform.target_width, top + transform.target_height)
             )
-            array = np.asarray(image, dtype=np.float32).copy() / 255.0
+            array = np.asarray(image, dtype=np.uint8).copy()
         return torch.from_numpy(array).permute(2, 0, 1).contiguous()
 
     def read_depth(self, index: int, target_hw: tuple[int, int]) -> torch.Tensor:
@@ -781,6 +679,7 @@ class VipeRoomTourItem:
                 3,
                 target_hw[0],
                 target_hw[1],
+                dtype=torch.uint8,
             )
         return {
             "item_name": self.root.name,
@@ -823,25 +722,31 @@ class VipeRoomTourItem:
         }
 
 
-class RemoteVipeRoomTourDataset(IterableDataset):
-    """Infinite item-reuse stream for long room-tour training."""
+class LocalVipeRoomTourDataset(IterableDataset):
+    """Infinite worker-preloaded stream over mounted room-tour scenes."""
 
     def __init__(
         self,
-        dataset_root: str,
-        cache_root: str | Path,
+        dataset_root: str | Path,
         sample_config: LongTrajectorySampleConfig,
         *,
-        rclone: Optional[RcloneConfig] = None,
         item_list: Optional[list[str]] = None,
         seed: int = 42,
         rank: int = 0,
         world_size: int = 1,
     ) -> None:
         super().__init__()
-        self.item_cache = RoomTourItemCache(dataset_root, cache_root, rclone=rclone)
+        self.item_index = LocalRoomTourIndex(dataset_root)
         self.sample_config = sample_config
-        self.items = item_list or self.item_cache.list_items()
+        self.items = (
+            self.item_index.list_items()
+            if item_list is None
+            else list(item_list)
+        )
+        if not self.items:
+            raise ValueError("item_list cannot be empty")
+        for item_name in self.items:
+            self.item_index.item_path(item_name)
         self.seed = int(seed)
         self.rank = int(rank)
         self.world_size = int(world_size)
@@ -864,8 +769,9 @@ class RemoteVipeRoomTourDataset(IterableDataset):
             rng.shuffle(shuffled)
             for item_name in shuffled:
                 try:
-                    local_root = self.item_cache.materialize(item_name)
-                    item = VipeRoomTourItem(local_root)
+                    item = VipeRoomTourItem(
+                        self.item_index.item_path(item_name)
+                    )
                 except Exception:
                     logger.exception("failed to prepare room-tour item %s", item_name)
                     continue

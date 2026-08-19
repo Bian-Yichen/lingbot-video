@@ -13,10 +13,9 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
 
 from lingbot_video.latent_spatial_memory.data import (  # noqa: E402
+    LocalRoomTourIndex,
     SOURCE_FRAME_STRIDE,
     LongTrajectorySampleConfig,
-    RcloneConfig,
-    RoomTourItemCache,
     VipeRoomTourItem,
 )
 
@@ -31,14 +30,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--item_name", required=True)
     parser.add_argument(
         "--dataset_root",
-        default="h:bianyichen/AnyReconProDataset_labeled/",
-    )
-    parser.add_argument("--cache_root", default="/tmp/lingbot_latent_memory_cache")
-    parser.add_argument("--rclone_config", default=None)
-    parser.add_argument(
-        "--rclone_clear_proxy",
-        action=argparse.BooleanOptionalAction,
-        default=True,
+        default="/data/bianyichen/H-hdd/AnyReconProDataset_labeled_2",
     )
     parser.add_argument("--height", type=int, default=480)
     parser.add_argument("--width", type=int, default=832)
@@ -54,11 +46,11 @@ def parse_args() -> argparse.Namespace:
         "--tree_limit",
         type=int,
         default=200,
-        help="Maximum number of downloaded files to print; 0 disables the limit.",
+        help="Maximum number of local files to print; 0 disables the limit.",
     )
     parser.add_argument(
         "--break_at",
-        choices=("none", "after_download", "after_index"),
+        choices=("none", "after_resolve", "after_index"),
         default="none",
         help="Enter an interactive breakpoint in this main-process-only script.",
     )
@@ -81,7 +73,7 @@ def _format_bytes(size: int) -> str:
 
 
 def _print_tree(root: Path, limit: int) -> None:
-    print("\n=== DOWNLOADED FILES ===")
+    print("\n=== LOCAL FILES ===")
     files = sorted(path for path in root.rglob("*") if path.is_file())
     visible = files if limit <= 0 else files[:limit]
     for path in visible:
@@ -361,28 +353,18 @@ def main() -> None:
         history_max_frames=args.history_max_frames,
         latent_frames_per_chunk=args.latent_frames_per_chunk,
     )
-    cache = RoomTourItemCache(
-        args.dataset_root,
-        args.cache_root,
-        rclone=RcloneConfig(
-            config_path=args.rclone_config,
-            clear_proxy=args.rclone_clear_proxy,
-        ),
-    )
+    item_index = LocalRoomTourIndex(args.dataset_root)
 
-    print("=== MATERIALIZE ===")
+    print("=== RESOLVE LOCAL SCENE ===")
     print(f"dataset root: {args.dataset_root}")
     print(f"item:         {args.item_name}")
-    print(f"cache root:   {args.cache_root}")
-    local_root = cache.materialize(args.item_name)
+    local_root = item_index.item_path(args.item_name)
     print(f"local root:   {local_root}")
-    marker = local_root / ".latent_memory_cache_complete.json"
-    print(f"cache marker: {marker} ({'present' if marker.is_file() else 'absent'})")
     _print_expected_layout(local_root)
     _print_tree(local_root, args.tree_limit)
 
-    if args.break_at == "after_download":
-        print("\nBreakpoint after download. Useful variables: local_root, config, cache, args")
+    if args.break_at == "after_resolve":
+        print("\nBreakpoint after resolve. Useful variables: local_root, config, args")
         breakpoint()
 
     print("\n=== INDEX LOCAL ITEM ===")
