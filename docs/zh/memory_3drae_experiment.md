@@ -148,6 +148,10 @@ encoder token 数。
 
 ## 推理
 
+默认的 `sampling_profile=checkpoint` 会读取 checkpoint 中的训练进度，并使用该
+进度对应的 history/query curriculum 数量。因此早期 checkpoint 不会突然按最终
+的 12~32 张 history、8 张 query 测试。
+
 ```bash
 CUDA_VISIBLE_DEVICES=0 python scripts/inference_memory_3drae.py \
   --config configs/memory_3drae.json \
@@ -155,6 +159,9 @@ CUDA_VISIBLE_DEVICES=0 python scripts/inference_memory_3drae.py \
   --item_name 'zx8lnpzDG58_012000_017000.mp4' \
   --output_dir /tmp/memory-3drae-eval
 ```
+
+如果需要刻意测试最终 curriculum，增加 `--sampling_profile final`。也可以用
+`--query_views`、`--memory_views_min`、`--memory_views_max` 显式覆盖 profile。
 
 固定同一个 local window、target 和 history 数量：
 
@@ -166,6 +173,8 @@ CUDA_VISIBLE_DEVICES=0 python scripts/inference_memory_3drae.py \
   --local_window_start 500 \
   --target_start 536 \
   --memory_view_count 16 \
+  --memory_views_min 16 \
+  --memory_views_max 16 \
   --query_views 8 \
   --output_dir /tmp/memory-3drae-fixed
 ```
@@ -173,5 +182,18 @@ CUDA_VISIBLE_DEVICES=0 python scripts/inference_memory_3drae.py \
 输出包含 prediction、target、exact-target-latent 的 Wan VAE reconstruction、
 `latents_and_memory.pt` 和 `metrics.json`。metrics 额外记录 target 前后各有多少
 入选 history view，以及 history/target overlap（必须为 0）。
+
+## 训练过程可视化
+
+`visualization_every_iterations` 默认是 200。每到对应的全局 iteration，只有
+Accelerate 的 global main process 会把当前 batch 的第一个 scene 写到：
+
+```text
+<output_dir>/images/iter-00000200-step-00000200/<item_name>/
+```
+
+每个 query view 会保存 `prediction.png`、`target.png`，以及左侧 prediction、
+右侧 target 的 `comparison.png`；同目录的 `metadata.json` 记录 history/target
+帧号、epoch、stage 和本次 loss。设为 0 可以关闭可视化。
 
 父分支 checkpoint 与本分支结构不兼容，不能互相 resume。

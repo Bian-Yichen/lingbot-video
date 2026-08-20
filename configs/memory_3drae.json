@@ -58,5 +58,6 @@
   "dataloader_prefetch_factor": 1,
   "seed": 42,
   "checkpoint_every_iterations": 200,
+  "visualization_every_iterations": 200,
   "save_optimizer_state": false
 }

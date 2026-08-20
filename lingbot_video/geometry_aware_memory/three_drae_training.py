@@ -1,10 +1,15 @@
 from __future__ import annotations
 
+import json
+import re
 from dataclasses import dataclass
+from pathlib import Path
+from typing import Mapping
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from PIL import Image
 
 from .three_drae import WanThreeDRAEModel
 from .wan_latent_training import PreparedWanLatentBatch
@@ -189,6 +194,85 @@ class ThreeDRAEStepOutput:
     metrics: dict[str, torch.Tensor]
     predicted_rgb: torch.Tensor
     target_rgb: torch.Tensor
+
+
+def _rgb_image(tensor: torch.Tensor) -> Image.Image:
+    if tensor.ndim != 3 or tensor.shape[0] != 3:
+        raise ValueError("visualization RGB must be [3,H,W]")
+    array = (
+        tensor.detach()
+        .float()
+        .clamp(0, 1)
+        .mul(255)
+        .round()
+        .byte()
+        .permute(1, 2, 0)
+        .cpu()
+        .numpy()
+    )
+    return Image.fromarray(array)
+
+
+def save_three_drae_visualization(
+    output_dir: str | Path,
+    *,
+    item_name: str,
+    history_indices: list[int] | tuple[int, ...],
+    target_indices: list[int] | tuple[int, ...],
+    predicted_rgb: torch.Tensor,
+    target_rgb: torch.Tensor,
+    metrics: Mapping[str, float],
+    global_iteration: int,
+    global_step: int,
+    epoch: int,
+    stage: int,
+) -> Path:
+    """Save rank-zero training reconstructions for one scene."""
+
+    if predicted_rgb.shape != target_rgb.shape:
+        raise ValueError("visualization prediction/target shapes differ")
+    if predicted_rgb.ndim != 5 or predicted_rgb.shape[2] != 3:
+        raise ValueError("visualization RGB batches must be [B,V,3,H,W]")
+    if predicted_rgb.shape[0] < 1:
+        raise ValueError("visualization batch is empty")
+    if predicted_rgb.shape[1] != len(target_indices):
+        raise ValueError("target index count does not match decoded views")
+    safe_item_name = re.sub(r"[^A-Za-z0-9._-]+", "_", item_name).strip("._")
+    if not safe_item_name:
+        safe_item_name = "scene"
+    image_dir = (
+        Path(output_dir)
+        / "images"
+        / f"iter-{global_iteration:08d}-step-{global_step:08d}"
+        / safe_item_name
+    )
+    image_dir.mkdir(parents=True, exist_ok=True)
+    for view_index, frame_index in enumerate(target_indices):
+        prediction = _rgb_image(predicted_rgb[0, view_index])
+        target = _rgb_image(target_rgb[0, view_index])
+        prefix = f"view-{view_index:02d}-frame-{int(frame_index):06d}"
+        prediction.save(image_dir / f"{prefix}-prediction.png")
+        target.save(image_dir / f"{prefix}-target.png")
+        comparison = Image.new("RGB", (prediction.width * 2, prediction.height))
+        comparison.paste(prediction, (0, 0))
+        comparison.paste(target, (prediction.width, 0))
+        comparison.save(image_dir / f"{prefix}-comparison.png")
+    metadata = {
+        "item_name": item_name,
+        "global_iteration": int(global_iteration),
+        "global_step": int(global_step),
+        "epoch": int(epoch),
+        "stage": int(stage),
+        "history_indices_internal": [int(index) for index in history_indices],
+        "target_indices_internal": [int(index) for index in target_indices],
+        "comparison_layout": "prediction_left_target_right",
+        "metrics": {name: float(value) for name, value in metrics.items()},
+    }
+    (image_dir / "metadata.json").write_text(
+        json.dumps(metadata, indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    return image_dir
 
 
 def three_drae_training_step(

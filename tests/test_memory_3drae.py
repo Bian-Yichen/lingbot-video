@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import json
+
 import torch
 import torch.nn as nn
+from PIL import Image
 
 from lingbot_video.geometry_aware_memory.three_drae import (
     ThreeDRAEConfig,
@@ -12,6 +15,7 @@ from lingbot_video.geometry_aware_memory.three_drae_training import (
     ThreeDRAEObjective,
     adaptive_adversarial_weight,
     hinge_discriminator_loss,
+    save_three_drae_visualization,
 )
 from lingbot_video.geometry_aware_memory.wan_latent_reconstruction import (
     LoRAConv2d1x1,
@@ -223,3 +227,38 @@ def test_paper_reconstruction_and_gan_helpers_are_differentiable() -> None:
     )
     assert weight.ndim == 0
     assert torch.isfinite(weight)
+
+
+def test_training_visualization_saves_prediction_target_and_metadata(
+    tmp_path,
+) -> None:
+    predicted = torch.zeros(1, 2, 3, 4, 6)
+    target = torch.ones_like(predicted)
+    image_dir = save_three_drae_visualization(
+        tmp_path,
+        item_name="scene/example.mp4",
+        history_indices=[1, 2, 8],
+        target_indices=[4, 5],
+        predicted_rgb=predicted,
+        target_rgb=target,
+        metrics={"rgb_mse": 1.0},
+        global_iteration=200,
+        global_step=100,
+        epoch=1,
+        stage=1,
+    )
+    assert image_dir == (
+        tmp_path
+        / "images"
+        / "iter-00000200-step-00000100"
+        / "scene_example.mp4"
+    )
+    assert len(list(image_dir.glob("*-prediction.png"))) == 2
+    assert len(list(image_dir.glob("*-target.png"))) == 2
+    comparisons = list(image_dir.glob("*-comparison.png"))
+    assert len(comparisons) == 2
+    with Image.open(comparisons[0]) as image:
+        assert image.size == (12, 4)
+    metadata = json.loads((image_dir / "metadata.json").read_text())
+    assert metadata["comparison_layout"] == "prediction_left_target_right"
+    assert metadata["target_indices_internal"] == [4, 5]

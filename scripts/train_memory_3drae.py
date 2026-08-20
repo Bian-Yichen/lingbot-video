@@ -35,6 +35,7 @@ from lingbot_video.geometry_aware_memory.three_drae_training import (  # noqa: E
     ThreeDRAEObjective,
     adaptive_adversarial_weight,
     hinge_discriminator_loss,
+    save_three_drae_visualization,
     three_drae_training_step,
 )
 from lingbot_video.geometry_aware_memory.wan_latent_reconstruction import (  # noqa: E402,E501
@@ -150,6 +151,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dataloader_prefetch_factor", type=int, default=1)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--checkpoint_every_iterations", type=int, default=200)
+    parser.add_argument("--visualization_every_iterations", type=int, default=200)
     parser.add_argument(
         "--save_optimizer_state",
         action=argparse.BooleanOptionalAction,
@@ -211,6 +213,7 @@ def parse_args() -> argparse.Namespace:
         "discriminator_warmup_steps",
         "discriminator_start_step",
         "adversarial_start_step",
+        "visualization_every_iterations",
     ):
         if getattr(args, name) < 0:
             parser.error(f"--{name} cannot be negative")
@@ -677,6 +680,8 @@ def main() -> None:
         "total_parameters": total_parameters,
         "trainable_parameters": trainable_parameters,
         "total_optimizer_steps": total_optimizer_steps,
+        "visualization_every_iterations": args.visualization_every_iterations,
+        "visualization_output": str(output_dir / "images"),
     }
     if accelerator.is_main_process:
         logger.info(
@@ -937,6 +942,32 @@ def main() -> None:
                 name: float(value.item())
                 for name, value in zip(metric_names, means, strict=True)
             }
+            if (
+                args.visualization_every_iterations > 0
+                and global_iteration % args.visualization_every_iterations == 0
+                and accelerator.is_main_process
+            ):
+                target_indices = [
+                    index for block in sample.query_rgb_blocks for index in block
+                ]
+                visualization_metrics = {
+                    name: float(metrics[name].detach().float().item())
+                    for name in metric_names
+                }
+                visualization_dir = save_three_drae_visualization(
+                    output_dir,
+                    item_name=sample.item_name,
+                    history_indices=sample.capture_rgb_indices,
+                    target_indices=target_indices,
+                    predicted_rgb=step_output.predicted_rgb,
+                    target_rgb=step_output.target_rgb,
+                    metrics=visualization_metrics,
+                    global_iteration=global_iteration,
+                    global_step=global_step,
+                    epoch=epoch + 1,
+                    stage=stage,
+                )
+                logger.info("saved visualization %s", visualization_dir)
             if accelerator.is_main_process:
                 logger.info(
                     "scene epoch=%d/%d stage=%d iter=%d/%d item=%s "

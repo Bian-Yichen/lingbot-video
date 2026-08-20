@@ -22,6 +22,7 @@ from lingbot_video.geometry_aware_memory.data import (  # noqa: E402
 )
 from lingbot_video.geometry_aware_memory.three_drae import (  # noqa: E402
     ThreeDRAEConfig,
+    ThreeDRAEViewCurriculum,
     WanThreeDRAEModel,
 )
 from lingbot_video.geometry_aware_memory.wan_latent_reconstruction import (  # noqa: E402,E501
@@ -61,12 +62,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--width", type=int, default=832)
     parser.add_argument("--query_blocks", type=int, default=1)
     parser.add_argument("--query_views", type=int, default=None)
+    parser.add_argument("--query_views_start", type=int, default=2)
     parser.add_argument("--query_views_end", type=int, default=8)
     parser.add_argument("--local_window_rgb_frames", type=int, default=81)
     parser.add_argument("--memory_views_min", type=int, default=None)
     parser.add_argument("--memory_views_max", type=int, default=None)
+    parser.add_argument("--history_views_start_min", type=int, default=2)
+    parser.add_argument("--history_views_start_max", type=int, default=4)
     parser.add_argument("--history_views_end_min", type=int, default=12)
     parser.add_argument("--history_views_end_max", type=int, default=32)
+    parser.add_argument("--view_curriculum_epochs", type=int, default=8)
     parser.add_argument("--retrieval_rotation_weight", type=float, default=0.25)
     parser.add_argument("--retrieval_temperature", type=float, default=0.25)
     parser.add_argument("--vae_encode_chunk_rgb_frames", type=int, default=16)
@@ -80,6 +85,16 @@ def parse_args() -> argparse.Namespace:
         default="auto",
     )
     parser.add_argument(
+        "--sampling_profile",
+        choices=["checkpoint", "final"],
+        default="checkpoint",
+        help=(
+            "Use the view counts reached by this checkpoint, or the final "
+            "curriculum counts. Explicit --query_views/--memory_views_* "
+            "always override the profile."
+        ),
+    )
+    parser.add_argument(
         "--mixed_precision",
         choices=["no", "fp16", "bf16"],
         default="bf16",
@@ -88,12 +103,15 @@ def parse_args() -> argparse.Namespace:
     args = parser.parse_args()
     if not args.model_dir or not args.dataset_root:
         parser.error("model_dir and dataset_root are required")
-    if args.query_views is None:
-        args.query_views = args.query_views_end
-    if args.memory_views_min is None:
-        args.memory_views_min = args.history_views_end_min
-    if args.memory_views_max is None:
-        args.memory_views_max = args.history_views_end_max
+    if (args.memory_views_min is None) != (args.memory_views_max is None):
+        parser.error("memory_views_min and memory_views_max must be set together")
+    if args.query_views is not None and args.query_views < 1:
+        parser.error("query_views must be positive")
+    if args.memory_views_min is not None and (
+        args.memory_views_min < 1
+        or args.memory_views_max < args.memory_views_min
+    ):
+        parser.error("memory view range must be positive and ordered")
     explicit = (
         args.local_window_start,
         args.target_start,
@@ -164,6 +182,48 @@ def _select_stage(requested: str, checkpoint_payload: dict[str, Any]) -> int:
     return 1 if next_epoch < stage1_epochs else 2
 
 
+def _resolve_sampling_counts(
+    args: argparse.Namespace,
+    checkpoint_payload: dict[str, Any],
+) -> tuple[int, int, int, int]:
+    training = checkpoint_payload.get("training_config", {})
+
+    def value(name: str) -> int:
+        return int(training.get(name, getattr(args, name)))
+
+    curriculum = ThreeDRAEViewCurriculum(
+        history_start_min=value("history_views_start_min"),
+        history_start_max=value("history_views_start_max"),
+        history_end_min=value("history_views_end_min"),
+        history_end_max=value("history_views_end_max"),
+        query_start=value("query_views_start"),
+        query_end=value("query_views_end"),
+        curriculum_epochs=value("view_curriculum_epochs"),
+    )
+    curriculum.validate()
+    if args.sampling_profile == "checkpoint":
+        curriculum_epoch = int(checkpoint_payload.get("next_epoch", 0))
+        if (
+            "next_iteration_in_epoch" in checkpoint_payload
+            and int(checkpoint_payload["next_iteration_in_epoch"]) == 0
+            and curriculum_epoch > 0
+        ):
+            # An epoch-boundary checkpoint has finished the preceding epoch;
+            # test the view counts that its weights have actually seen.
+            curriculum_epoch -= 1
+    else:
+        curriculum_epoch = curriculum.curriculum_epochs - 1
+    memory_min, memory_max, query_views = curriculum.values_for_epoch(
+        curriculum_epoch
+    )
+    if args.memory_views_min is not None:
+        memory_min = int(args.memory_views_min)
+        memory_max = int(args.memory_views_max)
+    if args.query_views is not None:
+        query_views = int(args.query_views)
+    return memory_min, memory_max, query_views, curriculum_epoch
+
+
 def _load_model_and_encoder(
     args: argparse.Namespace,
     checkpoint_payload: dict[str, Any],
@@ -220,6 +280,9 @@ def main() -> None:
         map_location="cpu",
         weights_only=False,
     )
+    memory_views_min, memory_views_max, query_views, curriculum_epoch = (
+        _resolve_sampling_counts(args, checkpoint_payload)
+    )
     model, vae_encoder = _load_model_and_encoder(args, checkpoint_payload)
     prediction_stage = _select_stage(args.stage, checkpoint_payload)
     model.set_training_stage(prediction_stage)
@@ -229,11 +292,11 @@ def main() -> None:
     sample_config = GeometryMemorySampleConfig(
         height=args.height,
         width=args.width,
-        target_rgb_frames=args.query_views,
+        target_rgb_frames=query_views,
         query_blocks=args.query_blocks,
         local_window_rgb_frames=args.local_window_rgb_frames,
-        memory_views_min=args.memory_views_min,
-        memory_views_max=args.memory_views_max,
+        memory_views_min=memory_views_min,
+        memory_views_max=memory_views_max,
         retrieval_rotation_weight=args.retrieval_rotation_weight,
         retrieval_temperature=args.retrieval_temperature,
     )
@@ -324,6 +387,10 @@ def main() -> None:
     metadata = {
         "checkpoint": str(checkpoint_path),
         "prediction_stage": prediction_stage,
+        "sampling_profile": args.sampling_profile,
+        "sampling_curriculum_epoch_zero_based": curriculum_epoch,
+        "requested_history_view_range": [memory_views_min, memory_views_max],
+        "requested_query_views": query_views,
         "item_name": args.item_name,
         "history_indices_internal": list(sample.capture_rgb_indices),
         "target_indices_internal": target_indices,
