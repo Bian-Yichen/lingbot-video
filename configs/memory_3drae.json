@@ -1,7 +1,7 @@
 {
   "model_dir": "/mnt/shared-storage-user/bianyichen/lingbot-video-dense-1.3b",
   "dataset_root": "/data/bianyichen/H-hdd/AnyReconProDataset_labeled_2",
-  "output_dir": "/mnt/shared-storage-user/bianyichen/lingbot-video-memory-3drae-output",
+  "output_dir": "/mnt/shared-storage-user/bianyichen/lingbot-video-output/memory-3drae",
   "resume_from_checkpoint": null,
   "item_list": "/mnt/shared-storage-user/bianyichen/gim_world_train_items.txt",
   "height": 480,
@@ -36,7 +36,7 @@
   "rgb_loss_weight": 1,
   "lpips_weight": 1,
   "gan_loss_weight": 0.75,
-  "discriminator_model_name_or_path": "facebook/dinov2-small",
+  "discriminator_model_name_or_path": "/mnt/shared-storage-user/bianyichen/dinov2-small",
   "discriminator_image_size": 224,
   "discriminator_start_step": 50000,
   "adversarial_start_step": 60000,
