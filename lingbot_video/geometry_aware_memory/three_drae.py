@@ -554,8 +554,15 @@ class WanThreeDRAEModel(nn.Module):
         )[..., None, None]
         return self.memory_encoder(visible_features + rays), view_visibility
 
-    def add_decoder_noise(self, memory: torch.Tensor) -> torch.Tensor:
-        tau = self.reconstruction_config.decoder_noise_tau
+    def add_decoder_noise(
+        self,
+        memory: torch.Tensor,
+        *,
+        noise_scale: float = 1.0,
+    ) -> torch.Tensor:
+        if noise_scale < 0:
+            raise ValueError("decoder noise scale cannot be negative")
+        tau = self.reconstruction_config.decoder_noise_tau * float(noise_scale)
         if not self.training or tau <= 0:
             return memory
         sigma = torch.rand(
@@ -581,6 +588,7 @@ class WanThreeDRAEModel(nn.Module):
         target_intrinsics: torch.Tensor,
         *,
         view_visibility: torch.Tensor | None = None,
+        decoder_noise_scale: float = 1.0,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         memory, visibility = self.build_memory(
             history_latents,
@@ -599,7 +607,10 @@ class WanThreeDRAEModel(nn.Module):
             target_visible,
         )
         predicted_latents = self.latent_decoder(
-            self.add_decoder_noise(memory),
+            self.add_decoder_noise(
+                memory,
+                noise_scale=decoder_noise_scale,
+            ),
             target_rays,
         )
         native_latents = self.normalized_to_native(predicted_latents)

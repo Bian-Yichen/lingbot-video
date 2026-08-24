@@ -165,6 +165,23 @@ def test_invisible_history_views_are_explicit_model_inputs() -> None:
     assert torch.equal(returned, requested)
 
 
+def test_decoder_noise_can_be_warmed_up_without_changing_final_tau() -> None:
+    model = _model(decoder_noise_tau=0.8).train()
+    memory = torch.zeros(2, 6, 32)
+    assert torch.equal(
+        model.add_decoder_noise(memory, noise_scale=0.0),
+        memory,
+    )
+    torch.manual_seed(7)
+    noisy = model.add_decoder_noise(memory, noise_scale=1.0)
+    assert not torch.equal(noisy, memory)
+    model.eval()
+    assert torch.equal(
+        model.add_decoder_noise(memory, noise_scale=1.0),
+        memory,
+    )
+
+
 def test_stage_one_trains_3drae_but_not_frozen_wan_base() -> None:
     model = _model()
     model.set_training_stage(1)
@@ -246,6 +263,7 @@ def test_training_visualization_saves_prediction_target_and_metadata(
         global_step=100,
         epoch=1,
         stage=1,
+        prediction_mode="clean_eval_no_noise_no_view_mask",
     )
     assert image_dir == (
         tmp_path
@@ -261,4 +279,5 @@ def test_training_visualization_saves_prediction_target_and_metadata(
         assert image.size == (12, 4)
     metadata = json.loads((image_dir / "metadata.json").read_text())
     assert metadata["comparison_layout"] == "prediction_left_target_right"
+    assert metadata["prediction_mode"] == "clean_eval_no_noise_no_view_mask"
     assert metadata["target_indices_internal"] == [4, 5]

@@ -103,6 +103,7 @@ def parse_args() -> argparse.Namespace:
         default=True,
     )
     parser.add_argument("--decoder_noise_tau", type=float, default=0.8)
+    parser.add_argument("--decoder_noise_warmup_epochs", type=int, default=8)
     parser.add_argument("--view_mask_probability", type=float, default=0.1)
     parser.add_argument("--view_mask_ratio_min", type=float, default=0.6)
     parser.add_argument("--view_mask_ratio_max", type=float, default=0.9)
@@ -208,6 +209,7 @@ def parse_args() -> argparse.Namespace:
         "gan_loss_weight",
         "weight_decay",
         "decoder_noise_tau",
+        "decoder_noise_warmup_epochs",
         "lr_warmup_steps",
         "decoder_warmup_steps",
         "discriminator_warmup_steps",
@@ -265,6 +267,29 @@ def _dtype(name: str) -> torch.dtype:
         "fp16": torch.float16,
         "bf16": torch.bfloat16,
     }[name]
+
+
+def _decoder_noise_scale(
+    *,
+    epoch: int,
+    iteration_in_epoch: int,
+    iterations_per_epoch: int,
+    warmup_epochs: int,
+) -> float:
+    """Linearly introduce the paper's memory-noise regularizer.
+
+    Exact latent reconstruction is especially fragile at initialization: the
+    configured tau can exceed the standard deviation of a Wan target latent.
+    The curriculum leaves tau unchanged at convergence, but starts the decoder
+    from a clean memory signal.
+    """
+
+    if warmup_epochs <= 0:
+        return 1.0
+    epoch_progress = float(epoch) + float(iteration_in_epoch) / float(
+        max(1, iterations_per_epoch)
+    )
+    return min(max(epoch_progress / float(warmup_epochs), 0.0), 1.0)
 
 
 def _read_item_list(value: str | list[str] | None) -> list[str] | None:
@@ -666,6 +691,10 @@ def main() -> None:
         ],
         "query_curriculum": [args.query_views_start, args.query_views_end],
         "view_curriculum_epochs": args.view_curriculum_epochs,
+        "decoder_noise_tau": args.decoder_noise_tau,
+        "decoder_noise_warmup_epochs": args.decoder_noise_warmup_epochs,
+        "decoder_noise_schedule": "linear_zero_to_tau",
+        "view_mask_probability": args.view_mask_probability,
         "patches_per_view": patches_per_view,
         "memory_tokens": args.num_memory_tokens,
         "encoder_tokens_at_max_history": end_encoder_tokens,
@@ -823,6 +852,12 @@ def main() -> None:
         for scene_step in range(iteration_offset, len(dataloader)):
             sample = next(dataloader_iterator)
             started_at = time.perf_counter()
+            decoder_noise_scale = _decoder_noise_scale(
+                epoch=epoch,
+                iteration_in_epoch=scene_step,
+                iterations_per_epoch=len(dataloader),
+                warmup_epochs=args.decoder_noise_warmup_epochs,
+            )
             prepared = prepare_wan_latent_batch(
                 sample,
                 vae=vae_encoder,
@@ -842,8 +877,15 @@ def main() -> None:
                     objective=objective,
                     device=accelerator.device,
                     compute_dtype=_dtype(args.mixed_precision),
+                    decoder_noise_scale=decoder_noise_scale,
                 )
                 metrics = step_output.metrics
+                metrics["decoder_noise_scale"] = metrics[
+                    "reconstruction_loss"
+                ].new_tensor(decoder_noise_scale)
+                metrics["decoder_noise_tau_effective"] = metrics[
+                    "reconstruction_loss"
+                ].new_tensor(args.decoder_noise_tau * decoder_noise_scale)
                 reconstruction_loss = metrics["reconstruction_loss"]
                 adversarial_loss = reconstruction_loss.new_zeros(())
                 adaptive_weight = reconstruction_loss.new_zeros(())
@@ -930,8 +972,12 @@ def main() -> None:
                 "discriminator_loss",
                 "memory_norm",
                 "latent_prediction_std",
+                "latent_target_std",
+                "latent_std_ratio",
                 "rgb_prediction_std",
                 "visible_history_fraction",
+                "decoder_noise_scale",
+                "decoder_noise_tau_effective",
             )
             local_metrics = torch.stack(
                 [metrics[name].detach().float() for name in metric_names]
@@ -942,30 +988,92 @@ def main() -> None:
                 name: float(value.item())
                 for name, value in zip(metric_names, means, strict=True)
             }
-            if (
+            visualization_due = (
                 args.visualization_every_iterations > 0
                 and global_iteration % args.visualization_every_iterations == 0
-                and accelerator.is_main_process
-            ):
+            )
+            if visualization_due:
+                # The optimization forward intentionally runs in train mode and
+                # may contain memory noise and masked history views.  A saved
+                # image from that path is not representative of inference.
+                # Every rank participates in this extra eval forward so DDP and
+                # SyncBatchNorm remain collective-safe; only rank zero writes.
+                was_training = model.training
+                model.eval()
+                try:
+                    with torch.no_grad():
+                        (
+                            clean_predicted_latents,
+                            clean_predicted_rgb,
+                            _,
+                            _,
+                        ) = model(
+                            prepared.history_latents.to(
+                                device=accelerator.device,
+                                dtype=_dtype(args.mixed_precision),
+                            ),
+                            prepared.history_c2w.to(accelerator.device),
+                            prepared.history_intrinsics.to(accelerator.device),
+                            prepared.target_c2w.to(accelerator.device),
+                            prepared.target_intrinsics.to(accelerator.device),
+                            decoder_noise_scale=0.0,
+                        )
+                finally:
+                    model.train(was_training)
+                clean_latent_mse = (
+                    clean_predicted_latents.detach().float()
+                    - step_output.target_latents.detach().float()
+                ).square().mean()
+                clean_rgb_mse = (
+                    clean_predicted_rgb.detach().float()
+                    - step_output.target_rgb.detach().float()
+                ).square().mean()
+                clean_metric_names = (
+                    "clean_eval_latent_mse",
+                    "clean_eval_rgb_mse",
+                    "clean_eval_psnr",
+                    "clean_eval_latent_prediction_std",
+                )
+                local_clean_metrics = torch.stack(
+                    (
+                        clean_latent_mse,
+                        clean_rgb_mse,
+                        -10.0 * torch.log10(clean_rgb_mse.clamp_min(1.0e-12)),
+                        clean_predicted_latents.detach().float().std(),
+                    )
+                ).unsqueeze(0)
+                gathered_clean = accelerator.gather(local_clean_metrics)
+                clean_means = gathered_clean.reshape(
+                    -1,
+                    len(clean_metric_names),
+                ).mean(dim=0)
+                logged.update(
+                    {
+                        name: float(value.item())
+                        for name, value in zip(
+                            clean_metric_names,
+                            clean_means,
+                            strict=True,
+                        )
+                    }
+                )
+            if visualization_due and accelerator.is_main_process:
                 target_indices = [
                     index for block in sample.query_rgb_blocks for index in block
                 ]
-                visualization_metrics = {
-                    name: float(metrics[name].detach().float().item())
-                    for name in metric_names
-                }
                 visualization_dir = save_three_drae_visualization(
                     output_dir,
                     item_name=sample.item_name,
                     history_indices=sample.capture_rgb_indices,
                     target_indices=target_indices,
-                    predicted_rgb=step_output.predicted_rgb,
+                    predicted_rgb=clean_predicted_rgb,
                     target_rgb=step_output.target_rgb,
-                    metrics=visualization_metrics,
+                    metrics=logged,
                     global_iteration=global_iteration,
                     global_step=global_step,
                     epoch=epoch + 1,
                     stage=stage,
+                    prediction_mode="clean_eval_no_noise_no_view_mask",
                 )
                 logger.info("saved visualization %s", visualization_dir)
             if accelerator.is_main_process:

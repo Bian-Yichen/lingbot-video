@@ -89,8 +89,9 @@ min/max 区间；它不会让 target 与 history 重叠。
   checkpoint 会保存本实验实际估计出的 running stats。
 - 每个 sample 以 0.1 概率执行 view masking；触发后随机隐藏 60%~90%
   history views，并用 visibility=0 的 ray tokens 保留 pose 信息。
-- decoder 训练时给 memory 加噪：`sigma~Uniform(0,0.8)`，
-  `memory'=memory+sigma*epsilon`；eval 自动关闭。
+- decoder 训练时可给 memory 加噪：`sigma~Uniform(0,tau)`，
+  `memory'=memory+sigma*epsilon`；`decoder_noise_warmup_epochs` 会在训练开头
+  将有效 tau 从 0 线性增加到配置值，eval 自动关闭。
 - 默认重建目标为 RGB MSE + LPIPS；Wan adaptation 独有的 latent MSE 默认权重
   为 0，可做消融时开启。
 - DINOv2-Small hinge discriminator 从 step 50k 开始预热，adaptive GAN loss
@@ -104,6 +105,19 @@ DINOv2-Small 初始化，没有披露判别 head 和 GAN variant；本实现采�
 CLS token + linear logit head、hinge GAN，并按 VAE/VQGAN 常用的 last-layer
 gradient norm 计算 adaptive `omega_G`。这些是明确隔离的实现选择，不宣称为
 作者未公开的代码细节。
+
+当前 `configs/memory_3drae.json` 是“纯 Wan latent 精确回归”诊断配置：只保留
+latent MSE，并把 decoder noise 和 view masking 都设为 0。原因是这两个机制会
+刻意破坏 encoder 输入/scene memory，适合后续鲁棒表示训练，但会混淆当前对
+memory encoder 与 query decoder 基础重建能力的判断。需要恢复论文式正则时，
+可重新设置 `decoder_noise_tau=0.8`、`view_mask_probability=0.1`；noise 会按上述
+warmup 慢启动。
+
+训练期间保存到 `output_dir/images` 的预测会额外执行一次 `eval()` 前向，明确
+关闭 memory noise 和 view masking。多卡都参加前向以保证 DDP/SyncBatchNorm
+安全，但只由 rank 0 写文件；`metadata.json` 的 `prediction_mode` 会记录
+`clean_eval_no_noise_no_view_mask`。因此这里的图片可以直接和独立 inference
+比较，不再把随机训练正则误判为模型纹理。
 
 ## 训练
 

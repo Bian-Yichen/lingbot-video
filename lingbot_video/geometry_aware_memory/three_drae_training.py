@@ -192,6 +192,8 @@ def adaptive_adversarial_weight(
 @dataclass
 class ThreeDRAEStepOutput:
     metrics: dict[str, torch.Tensor]
+    predicted_latents: torch.Tensor
+    target_latents: torch.Tensor
     predicted_rgb: torch.Tensor
     target_rgb: torch.Tensor
 
@@ -226,6 +228,7 @@ def save_three_drae_visualization(
     global_step: int,
     epoch: int,
     stage: int,
+    prediction_mode: str = "training_forward",
 ) -> Path:
     """Save rank-zero training reconstructions for one scene."""
 
@@ -266,6 +269,7 @@ def save_three_drae_visualization(
         "history_indices_internal": [int(index) for index in history_indices],
         "target_indices_internal": [int(index) for index in target_indices],
         "comparison_layout": "prediction_left_target_right",
+        "prediction_mode": str(prediction_mode),
         "metrics": {name: float(value) for name, value in metrics.items()},
     }
     (image_dir / "metadata.json").write_text(
@@ -282,6 +286,7 @@ def three_drae_training_step(
     objective: ThreeDRAEObjective,
     device: torch.device,
     compute_dtype: torch.dtype,
+    decoder_noise_scale: float = 1.0,
 ) -> ThreeDRAEStepOutput:
     target_latents = batch.target_latents.to(
         device=device,
@@ -294,6 +299,7 @@ def three_drae_training_step(
         batch.history_intrinsics.to(device),
         batch.target_c2w.to(device),
         batch.target_intrinsics.to(device),
+        decoder_noise_scale=decoder_noise_scale,
     )
     metrics = objective(
         predicted_latents,
@@ -303,10 +309,16 @@ def three_drae_training_step(
     )
     metrics["memory_norm"] = memory.detach().float().norm(dim=-1).mean()
     metrics["latent_prediction_std"] = predicted_latents.detach().float().std()
+    metrics["latent_target_std"] = target_latents.detach().float().std()
+    metrics["latent_std_ratio"] = metrics["latent_prediction_std"] / metrics[
+        "latent_target_std"
+    ].clamp_min(1.0e-8)
     metrics["rgb_prediction_std"] = predicted_rgb.detach().float().std()
     metrics["visible_history_fraction"] = visibility.detach().float().mean()
     return ThreeDRAEStepOutput(
         metrics=metrics,
+        predicted_latents=predicted_latents,
+        target_latents=target_latents,
         predicted_rgb=predicted_rgb,
         target_rgb=target_rgb,
     )
